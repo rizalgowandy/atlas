@@ -6,27 +6,49 @@ package main
 
 import (
 	"bytes"
+	"embed"
 	_ "embed"
+	"flag"
+	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"text/template"
 )
 
-//go:generate go run main.go
-
-// Job defines an integration job to run.
-type Job struct {
-	Version string   // version to test (passed to go test as flag which database dialect/version)
-	Image   string   // name of service
-	Regex   string   // run regex
-	Env     []string // env of service
-	Ports   []string // port mappings
-	Options []string // other options
-}
+type (
+	// Step defines a step to run.
+	Step struct {
+		Name   string
+		Action string
+		With   []string
+	}
+	// Credentials is used to pull images from a private registry.
+	Credentials struct {
+		Username string
+		Password string
+	}
+	// Job defines an integration job to run.
+	Job struct {
+		Runner      string       // runner to use
+		Version     string       // version to test (passed to go test as flag which database dialect/version)
+		Image       string       // name of service
+		Credentials *Credentials // credentials to pull the image
+		Regex       string       // run regex
+		Env         []string     // env of service
+		Ports       []string     // port mappings
+		Volumes     []string     // volume mappings
+		Options     []string     // other options
+		Steps       []Step       // extra steps to run
+	}
+)
 
 var (
-	//go:embed ci.tmpl
-	t string
+	//go:embed *.tmpl
+	tplFS embed.FS
+	tpl   = template.Must(template.ParseFS(tplFS, "*.tmpl"))
 
 	mysqlOptions = []string{
 		`--health-cmd "mysqladmin ping -ppass"`,
@@ -99,6 +121,14 @@ var (
 			Options: mysqlOptions,
 		},
 		{
+			Version: "postgres-ext-postgis",
+			Image:   "postgis/postgis:latest",
+			Regex:   "Postgres",
+			Env:     pgEnv,
+			Ports:   []string{"5429:5432"},
+			Options: pgOptions,
+		},
+		{
 			Version: "postgres10",
 			Image:   "postgres:10",
 			Regex:   "Postgres",
@@ -139,36 +169,75 @@ var (
 			Options: pgOptions,
 		},
 		{
-			Version: "tidb5",
-			Image:   "pingcap/tidb:v5.4.0",
-			Regex:   "TiDB",
-			Ports:   []string{"4309:4000"},
-		},
-		{
-			Version: "tidb6",
-			Image:   "pingcap/tidb:v6.0.0",
-			Regex:   "TiDB",
-			Ports:   []string{"4310:4000"},
+			Version: "postgres15",
+			Image:   "postgres:15",
+			Regex:   "Postgres",
+			Env:     pgEnv,
+			Ports:   []string{"5435:5432"},
+			Options: pgOptions,
 		},
 		{
 			Version: "sqlite",
 			Regex:   "SQLite.*",
 		},
-		{
-			Version: "cockroach",
-			Image:   "ghcr.io/ariga/cockroachdb-single-node:v21.2.11",
-			Regex:   "Cockroach",
-			Ports:   []string{"26257:26257"},
-		},
 	}
 )
 
+type (
+	goVersions  []string
+	concurrency struct {
+		group  string
+		cancel bool
+	}
+)
+
+var data = struct {
+	Jobs                         []Job
+	Flavor, Tags, Runner, Suffix string
+	GoVersions                   goVersions
+	Concurrency                  concurrency
+	SharedSteps                  []Step
+	GlobalEnv                    []struct{ K, V string }
+}{
+	Concurrency: concurrency{
+		group:  "${{ github.workflow }}-${{ github.head_ref || github.run_id }}",
+		cancel: true,
+	},
+}
+
 func main() {
-	var buf bytes.Buffer
-	if err := template.Must(template.New("").Parse(t)).Execute(&buf, jobs); err != nil {
-		log.Fatalln(err)
+	flag.StringVar(&data.Flavor, "flavor", "", "")
+	flag.StringVar(&data.Tags, "tags", "", "")
+	flag.StringVar(&data.Runner, "runner", "ubuntu-latest", "")
+	flag.StringVar(&data.Suffix, "suffix", "", "")
+	flag.Parse()
+	for _, n := range []string{"dialect", "go", "revisions"} {
+		var (
+			buf bytes.Buffer
+			g   = data.Concurrency.group
+		)
+		if n == "dialect" {
+			// Dialect jobs are running after go jobs, putting them in the same concurrency group crates deadlock.
+			data.Concurrency.group = fmt.Sprintf("%s-dialect", g)
+		}
+		if err := tpl.ExecuteTemplate(&buf, fmt.Sprintf("ci_%s.tmpl", n), data); err != nil {
+			log.Fatalln(err)
+		}
+		data.Concurrency.group = g
+		err := os.WriteFile(filepath.Clean(fmt.Sprintf("../../.github/workflows/ci-%s_%s.yaml", n, data.Suffix)), buf.Bytes(), 0600)
+		if err != nil {
+			log.Fatalln(err)
+		}
 	}
-	if err := os.WriteFile("../../.github/workflows/ci.yml", buf.Bytes(), 0600); err != nil {
-		log.Fatalln(err)
+}
+
+func (v goVersions) String() (s string) {
+	for i := range v {
+		v[i] = strconv.Quote(v[i])
 	}
+	return fmt.Sprintf("[ %s ]", strings.Join(v, ", "))
+}
+
+func (c concurrency) String() (s string) {
+	return fmt.Sprintf("concurrency:\n  group: %s\n  cancel-in-progress: %t", c.group, c.cancel)
 }

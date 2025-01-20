@@ -7,8 +7,7 @@ package sqlx
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
-	"time"
+	"strings"
 
 	"ariga.io/atlas/sql/migrate"
 	"ariga.io/atlas/sql/schema"
@@ -18,20 +17,14 @@ import (
 // to interact with the development database.
 type DevDriver struct {
 	// A Driver connected to the dev database.
-	migrate.Driver
-
-	// MaxNameLen configures the max length of object names in
-	// the connected database (e.g. 64 in MySQL). Longer names
-	// are trimmed and suffixed with their hash.
-	MaxNameLen int
-
-	// DropClause holds optional clauses that
-	// can be added to the DropSchema change.
-	DropClause []schema.Clause
-
-	// PatchColumn allows providing a custom function to patch
-	// columns that hold a schema reference.
-	PatchColumn func(*schema.Schema, *schema.Column)
+	Driver interface {
+		migrate.Driver
+		migrate.CleanChecker
+		migrate.Snapshoter
+	}
+	// PathObject allows providing a custom function to patch
+	// objects that hold a schema reference.
+	PatchObject func(*schema.Schema, schema.Object)
 }
 
 // NormalizeRealm implements the schema.Normalizer interface.
@@ -40,93 +33,292 @@ type DevDriver struct {
 // to their "normal presentation" in the database, by creating them temporarily in
 // a "dev database", and then inspects them from there.
 func (d *DevDriver) NormalizeRealm(ctx context.Context, r *schema.Realm) (nr *schema.Realm, err error) {
-	var (
-		names   = make(map[string]string)
-		changes = make([]schema.Change, 0, len(r.Schemas))
-		reverse = make([]schema.Change, 0, len(r.Schemas))
-		opts    = &schema.InspectRealmOption{
-			Schemas: make([]string, 0, len(r.Schemas)),
-		}
-	)
-	for _, s := range r.Schemas {
-		if s.Realm != r {
-			s.Realm = r
-		}
-		dev := d.formatName(s.Name)
-		names[dev] = s.Name
-		s.Name = dev
-		opts.Schemas = append(opts.Schemas, s.Name)
-		// Skip adding the schema.IfNotExists clause
-		// to fail if the schema exists.
-		st := schema.New(dev).AddAttrs(s.Attrs...)
-		changes = append(changes, &schema.AddSchema{S: st})
-		reverse = append(reverse, &schema.DropSchema{S: st, Extra: append(d.DropClause, &schema.IfExists{})})
-		for _, t := range s.Tables {
-			// If objects are not strongly connected.
-			if t.Schema != s {
-				t.Schema = s
-			}
-			for _, c := range t.Columns {
-				if e, ok := c.Type.Type.(*schema.EnumType); ok && e.Schema != s {
-					e.Schema = s
-				}
-				if d.PatchColumn != nil {
-					d.PatchColumn(s, c)
-				}
-			}
-			changes = append(changes, &schema.AddTable{T: t})
-		}
+	restore, err := d.Driver.Snapshot(ctx)
+	if err != nil {
+		return nil, err
 	}
-	patch := func(r *schema.Realm) {
-		for _, s := range r.Schemas {
-			s.Name = names[s.Name]
-		}
-	}
-	// Delete the dev resources, and return
-	// the source realm to its initial state.
 	defer func() {
-		patch(r)
-		if rerr := d.ApplyChanges(ctx, reverse); rerr != nil {
+		if rerr := restore(ctx); rerr != nil {
 			if err != nil {
 				rerr = fmt.Errorf("%w: %v", err, rerr)
 			}
 			err = rerr
 		}
 	}()
-	if err := d.ApplyChanges(ctx, changes); err != nil {
+	var (
+		changes []schema.Change
+		opts    = &schema.InspectRealmOption{
+			Schemas: make([]string, 0, len(r.Schemas)),
+		}
+	)
+	for _, o := range r.Objects {
+		changes = append(changes, &schema.AddObject{
+			O: o,
+			Extra: []schema.Clause{
+				&schema.IfNotExists{},
+			},
+		})
+	}
+	name2pos := make(key2pos)
+	for _, s := range r.Schemas {
+		k, _ := name2pos.put(s.Attrs, keyS, s.Name)
+		opts.Schemas = append(opts.Schemas, s.Name)
+		changes = append(changes, &schema.AddSchema{
+			S: s,
+			Extra: []schema.Clause{
+				&schema.IfNotExists{},
+			},
+		})
+		for _, t := range s.Tables {
+			changes = append(changes, addTableChange(t)...)
+			// If the table was loaded with its position,
+			// record the position of its children.
+			if tk, ok := name2pos.put(t.Attrs, k, keyT, t.Name); ok {
+				name2pos.putTable(t, tk)
+			}
+		}
+		for _, v := range s.Views {
+			changes = append(changes, addViewChange(v)...)
+			// If the view was loaded with its position,
+			// record the position of its children.
+			if vk, ok := name2pos.put(v.Attrs, k, keyV, v.Name); ok {
+				name2pos.putView(v, vk)
+			}
+		}
+		for _, o := range s.Objects {
+			changes = append(changes, &schema.AddObject{O: o})
+		}
+		for _, f := range s.Funcs {
+			name2pos.put(f.Attrs, k, keyFn, f.Name)
+			changes = append(changes, &schema.AddFunc{F: f})
+		}
+		for _, p := range s.Procs {
+			name2pos.put(p.Attrs, k, keyPr, p.Name)
+			changes = append(changes, &schema.AddProc{P: p})
+		}
+	}
+	if err := d.Driver.ApplyChanges(ctx, changes); err != nil {
 		return nil, err
 	}
-	if nr, err = d.InspectRealm(ctx, opts); err != nil {
+	if nr, err = d.Driver.InspectRealm(ctx, opts); err != nil {
 		return nil, err
 	}
-	patch(nr)
+	if len(name2pos) > 0 {
+		name2pos.patchRealm(nr)
+	}
 	return nr, nil
 }
 
 // NormalizeSchema returns the normal representation of the given database. See NormalizeRealm for more info.
 func (d *DevDriver) NormalizeSchema(ctx context.Context, s *schema.Schema) (*schema.Schema, error) {
-	r := &schema.Realm{}
-	if s.Realm != nil {
-		r.Attrs = s.Realm.Attrs
-	}
-	r.Schemas = append(r.Schemas, s)
-	nr, err := d.NormalizeRealm(ctx, r)
+	restore, err := d.Driver.Snapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
-	ns, ok := nr.Schema(s.Name)
-	if !ok {
-		return nil, fmt.Errorf("missing normalized schema %q", s.Name)
+	defer func() {
+		if rerr := restore(ctx); rerr != nil {
+			if err != nil {
+				rerr = fmt.Errorf("%w: %v", err, rerr)
+			}
+			err = rerr
+		}
+	}()
+	dev, err := d.Driver.InspectSchema(ctx, "", &schema.InspectOptions{
+		Mode: schema.InspectSchemas,
+	})
+	if err != nil {
+		return nil, err
 	}
-	return ns, nil
+	// Modify dev-schema attributes if needed.
+	changes, err := d.Driver.SchemaDiff(
+		schema.New(dev.Name).AddAttrs(dev.Attrs...),
+		schema.New(dev.Name).AddAttrs(s.Attrs...),
+	)
+	if err != nil {
+		return nil, err
+	}
+	prevName := s.Name
+	s.Name = dev.Name
+	name2pos := make(key2pos)
+	k, _ := name2pos.put(s.Attrs, keyS, s.Name)
+	for _, t := range s.Tables {
+		// If objects are not strongly connected.
+		if t.Schema != s {
+			t.Schema = s
+		}
+		for _, c := range t.Columns {
+			if e, ok := c.Type.Type.(*schema.EnumType); ok && e.Schema != s {
+				e.Schema = s
+			}
+		}
+		changes = append(changes, addTableChange(t)...)
+		if tk, ok := name2pos.put(t.Attrs, k, keyT, t.Name); ok {
+			name2pos.putTable(t, tk)
+		}
+	}
+	for _, v := range s.Views {
+		// If objects are not strongly connected.
+		if v.Schema != s {
+			v.Schema = s
+		}
+		changes = append(changes, addViewChange(v)...)
+		if vk, ok := name2pos.put(v.Attrs, k, keyV, v.Name); ok {
+			name2pos.putView(v, vk)
+		}
+	}
+	for _, o := range s.Objects {
+		if d.PatchObject != nil {
+			d.PatchObject(s, o)
+		}
+		changes = append(changes, &schema.AddObject{O: o})
+	}
+	for _, f := range s.Funcs {
+		changes = append(changes, &schema.AddFunc{F: f})
+	}
+	for _, p := range s.Procs {
+		changes = append(changes, &schema.AddProc{P: p})
+	}
+	if err := d.Driver.ApplyChanges(ctx, changes, func(opts *migrate.PlanOptions) {
+		noQualifier := ""
+		opts.SchemaQualifier = &noQualifier
+		opts.Mode = migrate.PlanModeInPlace
+	}); err != nil {
+		return nil, err
+	}
+	ns, err := d.Driver.InspectSchema(ctx, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	// Preserve the original schema name and attributes.
+	ns.Name = prevName
+	for _, a := range s.Attrs {
+		schema.ReplaceOrAppend(&ns.Attrs, a)
+	}
+	if len(name2pos) > 0 {
+		name2pos.patchSchema(ns)
+	}
+	return ns, err
 }
 
-func (d *DevDriver) formatName(name string) string {
-	dev := fmt.Sprintf("atlas_dev_%s_%d", name, time.Now().Unix())
-	if d.MaxNameLen == 0 || len(dev) <= d.MaxNameLen {
-		return dev
+const (
+	keyS  = "schema"
+	keyV  = "view"
+	keyT  = "table"
+	keyC  = "column"
+	keyI  = "index"
+	keyP  = "pk"
+	keyF  = "fk"
+	keyK  = "check"
+	keyTg = "trigger"
+	keyFn = "function"
+	keyPr = "procedure"
+)
+
+type key2pos map[string]*schema.Pos
+
+func (k key2pos) putTable(t *schema.Table, tk string) {
+	for _, c := range t.Columns {
+		k.put(c.Attrs, tk, keyC, c.Name)
 	}
-	h := fnv.New128()
-	h.Write([]byte(dev))
-	return fmt.Sprintf("%s_%x", dev[:d.MaxNameLen-1-h.Size()*2], h.Sum(nil))
+	for _, i := range t.Indexes {
+		k.put(i.Attrs, tk, keyI, i.Name)
+	}
+	for _, f := range t.ForeignKeys {
+		k.put(f.Attrs, tk, keyF, f.Symbol)
+	}
+	for _, ck := range t.Checks() {
+		k.put(ck.Attrs, tk, keyK, ck.Name)
+	}
+	if t.PrimaryKey != nil {
+		k.put(t.PrimaryKey.Attrs, tk, keyP, t.PrimaryKey.Name)
+	}
+	for _, r := range t.Triggers {
+		k.put(r.Attrs, tk, keyTg, r.Name)
+	}
+}
+
+func (k key2pos) putView(v *schema.View, vk string) {
+	for _, c := range v.Columns {
+		k.put(c.Attrs, vk, keyC, c.Name)
+	}
+	for _, i := range v.Indexes {
+		k.put(i.Attrs, vk, keyI, i.Name)
+	}
+	for _, r := range v.Triggers {
+		k.put(r.Attrs, vk, keyTg, r.Name)
+	}
+}
+
+func (k key2pos) put(attrs []schema.Attr, typename ...string) (string, bool) {
+	n := poskey(typename...)
+	if p := (schema.Pos{}); Has(attrs, &p) {
+		k[n] = &p
+		return n, true
+	}
+	return n, false
+}
+
+func (k key2pos) patchRealm(r *schema.Realm) {
+	for _, s := range r.Schemas {
+		k.patchSchema(s)
+	}
+}
+
+func (k key2pos) patchSchema(s *schema.Schema) {
+	ks, _ := k.patch(&s.Attrs, keyS, s.Name)
+	for _, t := range s.Tables {
+		tk, ok := k.patch(&t.Attrs, ks, keyT, t.Name)
+		if !ok {
+			continue
+		}
+		for _, tr := range t.Triggers {
+			k.patch(&tr.Attrs, tk, keyTg, tr.Name)
+		}
+		for _, c := range t.Columns {
+			k.patch(&c.Attrs, tk, keyC, c.Name)
+		}
+		for _, i := range t.Indexes {
+			k.patch(&i.Attrs, tk, keyI, i.Name)
+		}
+		for _, f := range t.ForeignKeys {
+			k.patch(&f.Attrs, tk, keyF, f.Symbol)
+		}
+		for _, ck := range t.Checks() {
+			k.patch(&ck.Attrs, tk, keyK, ck.Name)
+		}
+	}
+	for _, v := range s.Views {
+		vk, ok := k.patch(&v.Attrs, ks, keyV, v.Name)
+		if !ok {
+			continue
+		}
+		for _, tr := range v.Triggers {
+			k.patch(&tr.Attrs, vk, keyTg, tr.Name)
+		}
+		for _, c := range v.Columns {
+			k.patch(&c.Attrs, vk, keyC, c.Name)
+		}
+		for _, i := range v.Indexes {
+			k.patch(&i.Attrs, vk, keyI, i.Name)
+		}
+	}
+	for _, f := range s.Funcs {
+		k.patch(&f.Attrs, ks, keyFn, f.Name)
+	}
+	for _, p := range s.Procs {
+		k.patch(&p.Attrs, ks, keyPr, p.Name)
+	}
+}
+
+func (k key2pos) patch(attrs *[]schema.Attr, typename ...string) (string, bool) {
+	n := poskey(typename...)
+	if p, ok := k[n]; ok {
+		*attrs = append(*attrs, p)
+		return n, true
+	}
+	return n, false
+}
+
+func poskey(typename ...string) string {
+	return strings.Join(typename, ".")
 }

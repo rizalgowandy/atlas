@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"ariga.io/atlas/cmd/atlas/internal/cmdapi"
 	"ariga.io/atlas/cmd/atlas/internal/cmdapi/vercheck"
+	"ariga.io/atlas/cmd/atlas/internal/cmdlog"
 	_ "ariga.io/atlas/cmd/atlas/internal/docker"
 	_ "ariga.io/atlas/sql/mysql"
 	_ "ariga.io/atlas/sql/mysql/mysqlcheck"
@@ -21,22 +23,42 @@ import (
 	_ "ariga.io/atlas/sql/postgres/postgrescheck"
 	_ "ariga.io/atlas/sql/sqlite"
 	_ "ariga.io/atlas/sql/sqlite/sqlitecheck"
-	"github.com/mitchellh/go-homedir"
-	"golang.org/x/mod/semver"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
+	_ "github.com/libsql/libsql-client-go/libsql"
+	"github.com/mattn/go-isatty"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/spf13/cobra"
+	"golang.org/x/mod/semver"
 )
 
 func main() {
-	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 	cmdapi.Root.SetOut(os.Stdout)
-	update := checkForUpdate()
-	err := cmdapi.Root.ExecuteContext(ctx)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		// On first signal seen, cancel the context. On the second signal, force stop immediately.
+		stop := make(chan os.Signal, 2)
+		defer close(stop)
+		signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		defer signal.Stop(stop)
+		<-stop   // wait for first interrupt
+		cancel() // cancel context to gracefully stop
+		fmt.Fprintln(cmdapi.Root.OutOrStdout(), "\ninterrupt received, wait for exit or ^C to terminate")
+		// Wait for the context to be canceled. Issuing a second interrupt will cause the process to force stop.
+		<-stop // will not block if no signal received due to main routine exiting
+		os.Exit(1)
+	}()
+	ctx, err := extendContext(ctx)
+	cobra.CheckErr(err)
+	ctx, done := initialize(ctx)
+	update := checkForUpdate(ctx)
+	err = cmdapi.Root.ExecuteContext(ctx)
 	if u := update(); u != "" {
-		fmt.Println(u)
+		_ = cmdlog.WarnOnce(os.Stderr, cmdlog.ColorCyan(u))
 	}
+	done(err)
 	if err != nil {
 		os.Exit(1)
 	}
@@ -46,14 +68,11 @@ const (
 	// envNoUpdate when enabled it cancels checking for update
 	envNoUpdate = "ATLAS_NO_UPDATE_NOTIFIER"
 	vercheckURL = "https://vercheck.ariga.io"
-	versionFile = "~/.atlas/release.json"
 )
 
 func noText() string { return "" }
 
-// checkForUpdate checks for version updates and security advisories for Atlas.
-func checkForUpdate() func() string {
-	done := make(chan struct{})
+func checkForUpdate(ctx context.Context) func() string {
 	version := cmdapi.Version()
 	// Users may skip update checking behavior.
 	if v := os.Getenv(envNoUpdate); v != "" {
@@ -63,23 +82,28 @@ func checkForUpdate() func() string {
 	if !semver.IsValid(version) {
 		return noText
 	}
-	path, err := homedir.Expand(versionFile)
-	if err != nil {
-		return noText
+	endpoint := vercheckEndpoint(ctx)
+	vc := vercheck.New(endpoint)
+	if isatty.IsTerminal(os.Stdout.Fd()) {
+		return bgCheck(ctx, version, vc)
 	}
+	return func() string {
+		msg, _ := runCheck(ctx, vc, version)
+		return msg
+	}
+}
+
+// bgCheck checks for version updates and security advisories for Atlas in the background.
+func bgCheck(ctx context.Context, version string, vc *vercheck.VerChecker) func() string {
+	done := make(chan struct{})
 	var message string
 	go func() {
 		defer close(done)
-		vc := vercheck.New(vercheckURL, path)
-		payload, err := vc.Check(version)
+		msg, err := runCheck(ctx, vc, version)
 		if err != nil {
 			return
 		}
-		var b bytes.Buffer
-		if err := vercheck.Notify.Execute(&b, payload); err != nil {
-			return
-		}
-		message = b.String()
+		message = msg
 	}()
 	return func() string {
 		select {
@@ -88,4 +112,16 @@ func checkForUpdate() func() string {
 		}
 		return message
 	}
+}
+
+func runCheck(ctx context.Context, vc *vercheck.VerChecker, version string) (string, error) {
+	payload, err := vc.Check(ctx, version)
+	if err != nil {
+		return "", err
+	}
+	var b bytes.Buffer
+	if err := vercheck.Notify.Execute(&b, payload); err != nil {
+		return "", err
+	}
+	return b.String(), nil
 }

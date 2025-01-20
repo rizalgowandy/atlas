@@ -14,40 +14,64 @@ import (
 	"ariga.io/atlas/sql/schema"
 )
 
-// A Diff provides a SQLite implementation for sqlx.DiffDriver.
-type Diff struct{}
+// DefaultDiff provides basic diffing capabilities for MySQL dialects.
+// Note, it is recommended to call Open, create a new Driver and use its
+// Differ when a database connection is available.
+var DefaultDiff schema.Differ = &sqlx.Diff{DiffDriver: &diff{}}
+
+// A diff provides a SQLite implementation for sqlx.DiffDriver.
+type diff struct{}
 
 // SchemaAttrDiff returns a changeset for migrating schema attributes from one state to the other.
-func (d *Diff) SchemaAttrDiff(_, _ *schema.Schema) []schema.Change {
+func (*diff) SchemaAttrDiff(_, _ *schema.Schema) []schema.Change {
 	// No special schema attribute diffing for SQLite.
 	return nil
 }
 
+// RealmObjectDiff returns a changeset for migrating realm (database) objects
+// from one state to the other. For example, adding extensions or users.
+func (*diff) RealmObjectDiff(_, _ *schema.Realm) ([]schema.Change, error) {
+	return nil, nil
+}
+
+// SchemaObjectDiff returns a changeset for migrating schema objects from
+// one state to the other.
+func (*diff) SchemaObjectDiff(_, _ *schema.Schema, _ *schema.DiffOptions) ([]schema.Change, error) {
+	return nil, nil
+}
+
 // TableAttrDiff returns a changeset for migrating table attributes from one state to the other.
-func (d *Diff) TableAttrDiff(from, to *schema.Table) ([]schema.Change, error) {
+func (d *diff) TableAttrDiff(from, to *schema.Table, opts *schema.DiffOptions) ([]schema.Change, error) {
 	var changes []schema.Change
-	switch {
-	case sqlx.Has(from.Attrs, &WithoutRowID{}) && !sqlx.Has(to.Attrs, &WithoutRowID{}):
-		changes = append(changes, &schema.DropAttr{
-			A: &WithoutRowID{},
-		})
-	case !sqlx.Has(from.Attrs, &WithoutRowID{}) && sqlx.Has(to.Attrs, &WithoutRowID{}):
-		changes = append(changes, &schema.AddAttr{
-			A: &WithoutRowID{},
-		})
+	for _, a := range []schema.Attr{&WithoutRowID{}, &Strict{}} {
+		switch {
+		case sqlx.Has(from.Attrs, a) && !sqlx.Has(to.Attrs, a):
+			changes = append(changes, &schema.DropAttr{
+				A: a,
+			})
+		case !sqlx.Has(from.Attrs, a) && sqlx.Has(to.Attrs, a):
+			changes = append(changes, &schema.AddAttr{
+				A: a,
+			})
+		}
 	}
-	return append(changes, sqlx.CheckDiff(from, to)...), nil
+	return append(changes, sqlx.CheckDiffMode(from, to, opts.Mode)...), nil
+}
+
+func (*diff) ViewAttrChanges(_, _ *schema.View) []schema.Change {
+	return nil // Not implemented.
 }
 
 // ColumnChange returns the schema changes (if any) for migrating one column to the other.
-func (d *Diff) ColumnChange(_ *schema.Table, from, to *schema.Column) (schema.ChangeKind, error) {
-	change := sqlx.CommentChange(from.Attrs, to.Attrs)
+// Note that column comments are ignored as SQLite does not support it.
+func (d *diff) ColumnChange(_ *schema.Table, from, to *schema.Column, _ *schema.DiffOptions) (schema.Change, error) {
+	var change schema.ChangeKind
 	if from.Type.Null != to.Type.Null {
 		change |= schema.ChangeNull
 	}
 	changed, err := d.typeChanged(from, to)
 	if err != nil {
-		return schema.NoChange, err
+		return sqlx.NoChange, err
 	}
 	if changed {
 		change |= schema.ChangeType
@@ -58,21 +82,32 @@ func (d *Diff) ColumnChange(_ *schema.Table, from, to *schema.Column) (schema.Ch
 	if d.generatedChanged(from, to) {
 		change |= schema.ChangeGenerated
 	}
-	return change, nil
+	if change.Is(schema.NoChange) {
+		return sqlx.NoChange, nil
+	}
+	return &schema.ModifyColumn{
+		Change: change,
+		From:   from,
+		To:     to,
+	}, nil
 }
 
 // typeChanged reports if the column type was changed.
-func (d *Diff) typeChanged(from, to *schema.Column) (bool, error) {
+func (d *diff) typeChanged(from, to *schema.Column) (bool, error) {
 	fromT, toT := from.Type.Type, to.Type.Type
 	if fromT == nil || toT == nil {
 		return false, fmt.Errorf("sqlite: missing type information for column %q", from.Name)
+	}
+	if u1, ok := fromT.(*UserDefinedType); ok {
+		u2, ok := toT.(*UserDefinedType)
+		return !ok || u1.T != u2.T, nil
 	}
 	// Types are mismatched if they do not have the same "type affinity".
 	return reflect.TypeOf(fromT) != reflect.TypeOf(toT), nil
 }
 
 // defaultChanged reports if the default value of a column was changed.
-func (d *Diff) defaultChanged(from, to *schema.Column) bool {
+func (d *diff) defaultChanged(from, to *schema.Column) bool {
 	d1, ok1 := sqlx.DefaultValue(from)
 	d2, ok2 := sqlx.DefaultValue(to)
 	if ok1 != ok2 {
@@ -87,7 +122,7 @@ func (d *Diff) defaultChanged(from, to *schema.Column) bool {
 }
 
 // generatedChanged reports if the generated expression of a column was changed.
-func (*Diff) generatedChanged(from, to *schema.Column) bool {
+func (*diff) generatedChanged(from, to *schema.Column) bool {
 	var (
 		fromX, toX     schema.GeneratedExpr
 		fromHas, toHas = sqlx.Has(from.Attrs, &fromX), sqlx.Has(to.Attrs, &toX)
@@ -97,7 +132,7 @@ func (*Diff) generatedChanged(from, to *schema.Column) bool {
 
 // IsGeneratedIndexName reports if the index name was generated by the database.
 // See: https://github.com/sqlite/sqlite/blob/e937df8/src/build.c#L3583.
-func (d *Diff) IsGeneratedIndexName(t *schema.Table, idx *schema.Index) bool {
+func (d *diff) IsGeneratedIndexName(t *schema.Table, idx *schema.Index) bool {
 	p := fmt.Sprintf("sqlite_autoindex_%s_", t.Name)
 	if !strings.HasPrefix(idx.Name, p) {
 		return false
@@ -106,19 +141,31 @@ func (d *Diff) IsGeneratedIndexName(t *schema.Table, idx *schema.Index) bool {
 	return err == nil && i > 0
 }
 
+// FindGeneratedIndex finds the table index that represents the generated index.
+// This is useful because unlike MySQL/PostgreSQL, SQLite does not allow creating
+// the generated indexes with their internal names. Therefore, they are renamed in
+// normalization phase. See migrate.go#normalizeIdxName for more details.
+func (d *diff) FindGeneratedIndex(t *schema.Table, idx *schema.Index) (*schema.Index, bool) {
+	nr := schema.NewIndex(idx.Name)
+	if normalizeIdxName(nr, t) != nil {
+		return nil, false
+	}
+	return t.Index(nr.Name)
+}
+
 // IndexAttrChanged reports if the index attributes were changed.
-func (*Diff) IndexAttrChanged(from, to []schema.Attr) bool {
+func (*diff) IndexAttrChanged(from, to []schema.Attr) bool {
 	var p1, p2 IndexPredicate
 	return sqlx.Has(from, &p1) != sqlx.Has(to, &p2) || (p1.P != p2.P && p1.P != sqlx.MayWrap(p2.P))
 }
 
 // IndexPartAttrChanged reports if the index-part attributes were changed.
-func (*Diff) IndexPartAttrChanged(_, _ *schema.Index, _ int) bool {
+func (*diff) IndexPartAttrChanged(_, _ *schema.Index, _ int) bool {
 	return false
 }
 
 // ReferenceChanged reports if the foreign key referential action was changed.
-func (*Diff) ReferenceChanged(from, to schema.ReferenceOption) bool {
+func (*diff) ReferenceChanged(from, to schema.ReferenceOption) bool {
 	// According to SQLite, if an action is not explicitly
 	// specified, it defaults to "NO ACTION".
 	if from == "" {
@@ -130,8 +177,13 @@ func (*Diff) ReferenceChanged(from, to schema.ReferenceOption) bool {
 	return from != to
 }
 
+// ForeignKeyAttrChanged reports if any of the foreign-key attributes were changed.
+func (*diff) ForeignKeyAttrChanged(_, _ []schema.Attr) bool {
+	return false
+}
+
 // Normalize implements the sqlx.Normalizer interface.
-func (d *Diff) Normalize(from, to *schema.Table) error {
+func (d *diff) Normalize(from, to *schema.Table, _ *schema.DiffOptions) error {
 	used := make([]bool, len(to.ForeignKeys))
 	// In SQLite, there is no easy way to get the foreign-key constraint
 	// name, except for parsing the CREATE statement. Therefore, we check
@@ -141,10 +193,17 @@ func (d *Diff) Normalize(from, to *schema.Table) error {
 			if used[i] {
 				continue
 			}
-			if fk2.Symbol == fk1.Symbol && !isNumber(fk1.Symbol) || sameFK(fk1, fk2) {
+			if fk2.Symbol == fk1.Symbol && !sqlx.IsUint(fk1.Symbol) || sameFK(fk1, fk2) {
 				fk1.Symbol = fk2.Symbol
 				used[i] = true
 			}
+		}
+	}
+	// Normalize names of indexes generated by UNIQUE constraints before
+	// comparing. See the normalizeIdxName function for details.
+	for _, idx := range to.Indexes {
+		if err := normalizeIdxName(idx, to); err != nil {
+			return err
 		}
 	}
 	return nil

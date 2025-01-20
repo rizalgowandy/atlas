@@ -6,7 +6,6 @@ package sqlite
 
 import (
 	"fmt"
-	"reflect"
 	"strconv"
 	"strings"
 
@@ -20,44 +19,113 @@ import (
 	"github.com/zclconf/go-cty/cty"
 )
 
-// evalSpec evaluates an Atlas DDL document using an unmarshaler into v by using the input.
-func evalSpec(p *hclparse.Parser, v any, input map[string]cty.Value) error {
-	var d doc
-	if err := hclState.Eval(p, &d, input); err != nil {
-		return err
-	}
+type doc struct {
+	Tables   []*sqlspec.Table   `spec:"table"`
+	Views    []*sqlspec.View    `spec:"view"`
+	Triggers []*sqlspec.Trigger `spec:"trigger"`
+	Schemas  []*sqlspec.Schema  `spec:"schema"`
+}
+
+// Codec for schemahcl.
+type Codec struct {
+	State *schemahcl.State
+}
+
+// Eval evaluates an Atlas DDL document into v using the input.
+func (c *Codec) Eval(p *hclparse.Parser, v any, input map[string]cty.Value) error {
+	return c.EvalOptions(p, v, &schemahcl.EvalOptions{Variables: input})
+}
+
+// EvalOptions decodes the HCL with the given options.
+func (c *Codec) EvalOptions(p *hclparse.Parser, v any, opts *schemahcl.EvalOptions) error {
 	switch v := v.(type) {
 	case *schema.Realm:
-		err := specutil.Scan(v, d.Schemas, d.Tables, convertTable)
-		if err != nil {
-			return fmt.Errorf("specutil: failed converting to *schema.Realm: %w", err)
-		}
-	case *schema.Schema:
-		if len(d.Schemas) != 1 {
-			return fmt.Errorf("specutil: expecting document to contain a single schema, got %d", len(d.Schemas))
-		}
-		var r schema.Realm
-		if err := specutil.Scan(&r, d.Schemas, d.Tables, convertTable); err != nil {
+		var d doc
+		if err := c.State.EvalOptions(p, &d, opts); err != nil {
 			return err
 		}
-		r.Schemas[0].Realm = nil
+		if err := specutil.Scan(v,
+			&specutil.ScanDoc{Schemas: d.Schemas, Tables: d.Tables, Views: d.Views, Triggers: d.Triggers},
+			scanFuncs,
+		); err != nil {
+			return fmt.Errorf("sqlite: failed converting to *schema.Realm: %w", err)
+		}
+	case *schema.Schema:
+		var d doc
+		if err := c.State.EvalOptions(p, &d, opts); err != nil {
+			return err
+		}
+		if len(d.Schemas) != 1 {
+			return fmt.Errorf("sqlite: expecting document to contain a single schema, got %d", len(d.Schemas))
+		}
+		r := &schema.Realm{}
+		if err := specutil.Scan(r,
+			&specutil.ScanDoc{Schemas: d.Schemas, Tables: d.Tables, Views: d.Views, Triggers: d.Triggers},
+			scanFuncs,
+		); err != nil {
+			return err
+		}
 		*v = *r.Schemas[0]
+	case schema.Schema, schema.Realm:
+		return fmt.Errorf("sqlite: Eval expects a pointer: received %[1]T, expected *%[1]T", v)
 	default:
-		return fmt.Errorf("specutil: failed unmarshaling spec. %T is not supported", v)
+		return fmt.Errorf("sqlite: unexpected type %T", v)
 	}
 	return nil
 }
 
 // MarshalSpec marshals v into an Atlas DDL document using a schemahcl.Marshaler.
-func MarshalSpec(v any, marshaler schemahcl.Marshaler) ([]byte, error) {
-	return specutil.Marshal(v, marshaler, schemaSpec)
+func (c *Codec) MarshalSpec(v any) ([]byte, error) {
+	return specutil.Marshal(v, c.State, specutil.RealmFuncs{
+		Schema:   schemaSpec,
+		Triggers: triggersSpec,
+	})
 }
 
 // convertTable converts a sqlspec.Table to a schema.Table. Table conversion is done without converting
 // ForeignKeySpecs into ForeignKeys, as the target tables do not necessarily exist in the schema
 // at this point. Instead, the linking is done by the convertSchema function.
 func convertTable(spec *sqlspec.Table, parent *schema.Schema) (*schema.Table, error) {
-	return specutil.Table(spec, parent, convertColumn, specutil.PrimaryKey, convertIndex, specutil.Check)
+	t, err := specutil.Table(spec, parent, convertColumn, specutil.PrimaryKey, convertIndex, specutil.Check)
+	if err != nil {
+		return nil, err
+	}
+	if attr, ok := spec.Attr("without_rowid"); ok {
+		b, err := attr.Bool()
+		if err != nil {
+			return nil, err
+		}
+		if b {
+			t.AddAttrs(&WithoutRowID{})
+		}
+	}
+	if attr, ok := spec.Attr("strict"); ok {
+		b, err := attr.Bool()
+		if err != nil {
+			return nil, err
+		}
+		if b {
+			t.AddAttrs(&Strict{})
+		}
+	}
+	return t, nil
+}
+
+// convertView converts a sqlspec.View to a schema.View.
+func convertView(spec *sqlspec.View, parent *schema.Schema) (*schema.View, error) {
+	v, err := specutil.View(
+		spec, parent,
+		func(c *sqlspec.Column, _ *schema.View) (*schema.Column, error) {
+			return specutil.Column(c, convertColumnType)
+		},
+		func(i *sqlspec.Index, v *schema.View) (*schema.Index, error) {
+			return nil, fmt.Errorf("unexpected view index %s.%s", v.Name, i.Name)
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 // convertIndex converts a sqlspec.Index into a schema.Index.
@@ -103,20 +171,52 @@ func convertColumnType(spec *sqlspec.Column) (schema.Type, error) {
 }
 
 // schemaSpec converts from a concrete SQLite schema to Atlas specification.
-func schemaSpec(schem *schema.Schema) (*sqlspec.Schema, []*sqlspec.Table, error) {
-	return specutil.FromSchema(schem, tableSpec)
+func schemaSpec(s *schema.Schema) (*specutil.SchemaSpec, error) {
+	return specutil.FromSchema(s, &specutil.SchemaFuncs{
+		Table: tableSpec,
+		View:  viewSpec,
+	})
 }
 
 // tableSpec converts from a concrete SQLite sqlspec.Table to a schema.Table.
-func tableSpec(tab *schema.Table) (*sqlspec.Table, error) {
-	return specutil.FromTable(
-		tab,
+func tableSpec(t *schema.Table) (*sqlspec.Table, error) {
+	spec, err := specutil.FromTable(
+		t,
 		columnSpec,
 		specutil.FromPrimaryKey,
 		indexSpec,
 		specutil.FromForeignKey,
 		specutil.FromCheck,
 	)
+	if err != nil {
+		return nil, err
+	}
+	options := &schemahcl.Resource{}
+	if sqlx.Has(t.Attrs, &WithoutRowID{}) {
+		options.SetAttr(schemahcl.BoolAttr("without_rowid", true))
+	}
+	if sqlx.Has(t.Attrs, &Strict{}) {
+		options.SetAttr(schemahcl.BoolAttr("strict", true))
+	}
+	if options != nil {
+		spec.Extra.Children = append(spec.Extra.Children, options)
+	}
+	return spec, nil
+}
+
+// viewSpec converts from a concrete SQLite schema.View to a sqlspec.View.
+func viewSpec(view *schema.View) (*sqlspec.View, error) {
+	spec, err := specutil.FromView(
+		view,
+		func(c *schema.Column, _ *schema.View) (*sqlspec.Column, error) {
+			return specutil.FromColumn(c, columnTypeSpec)
+		},
+		indexSpec,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return spec, nil
 }
 
 func indexSpec(idx *schema.Index) (*sqlspec.Index, error) {
@@ -159,7 +259,7 @@ var TypeRegistry = schemahcl.NewRegistry(
 	schemahcl.WithFormatter(FormatType),
 	schemahcl.WithParser(ParseType),
 	schemahcl.WithSpecs(
-		schemahcl.NewTypeSpec(TypeReal, schemahcl.WithAttributes(&schemahcl.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false}, &schemahcl.TypeAttr{Name: "scale", Kind: reflect.Int, Required: false})),
+		schemahcl.NewTypeSpec(TypeReal, schemahcl.WithAttributes(schemahcl.PrecisionTypeAttr(), schemahcl.ScaleTypeAttr())),
 		schemahcl.NewTypeSpec(TypeBlob, schemahcl.WithAttributes(schemahcl.SizeTypeAttr(false))),
 		schemahcl.NewTypeSpec(TypeText, schemahcl.WithAttributes(schemahcl.SizeTypeAttr(false))),
 		schemahcl.NewTypeSpec(TypeInteger, schemahcl.WithAttributes(schemahcl.SizeTypeAttr(false))),
@@ -171,6 +271,7 @@ var TypeRegistry = schemahcl.NewRegistry(
 		schemahcl.AliasTypeSpec("unsigned_big_int", "unsigned big int", schemahcl.WithAttributes(schemahcl.SizeTypeAttr(false))),
 		schemahcl.NewTypeSpec("int2", schemahcl.WithAttributes(schemahcl.SizeTypeAttr(false))),
 		schemahcl.NewTypeSpec("int8", schemahcl.WithAttributes(schemahcl.SizeTypeAttr(false))),
+		schemahcl.NewTypeSpec("uint64", schemahcl.WithAttributes(schemahcl.SizeTypeAttr(false))),
 		schemahcl.NewTypeSpec("double", schemahcl.WithAttributes(schemahcl.SizeTypeAttr(false))),
 		schemahcl.AliasTypeSpec("double_precision", "double precision", schemahcl.WithAttributes(schemahcl.SizeTypeAttr(false))),
 		schemahcl.NewTypeSpec("float", schemahcl.WithAttributes(schemahcl.SizeTypeAttr(false))),
@@ -181,31 +282,33 @@ var TypeRegistry = schemahcl.NewRegistry(
 		schemahcl.AliasTypeSpec("native_character", "native character", schemahcl.WithAttributes(schemahcl.SizeTypeAttr(false))),
 		schemahcl.NewTypeSpec("nvarchar", schemahcl.WithAttributes(schemahcl.SizeTypeAttr(false))),
 		schemahcl.NewTypeSpec("clob", schemahcl.WithAttributes(schemahcl.SizeTypeAttr(false))),
-		schemahcl.NewTypeSpec("numeric", schemahcl.WithAttributes(&schemahcl.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false}, &schemahcl.TypeAttr{Name: "scale", Kind: reflect.Int, Required: false})),
-		schemahcl.NewTypeSpec("decimal", schemahcl.WithAttributes(&schemahcl.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false}, &schemahcl.TypeAttr{Name: "scale", Kind: reflect.Int, Required: false})),
+		schemahcl.NewTypeSpec("numeric", schemahcl.WithAttributes(schemahcl.PrecisionTypeAttr(), schemahcl.ScaleTypeAttr())),
+		schemahcl.NewTypeSpec("decimal", schemahcl.WithAttributes(schemahcl.PrecisionTypeAttr(), schemahcl.ScaleTypeAttr())),
 		schemahcl.NewTypeSpec("bool"),
 		schemahcl.NewTypeSpec("boolean"),
 		schemahcl.NewTypeSpec("date"),
 		schemahcl.NewTypeSpec("datetime"),
 		schemahcl.NewTypeSpec("json"),
 		schemahcl.NewTypeSpec("uuid"),
+		schemahcl.NewTypeSpec("jsonb"),
 	),
 )
 
 var (
-	hclState = schemahcl.New(
-		schemahcl.WithTypes(TypeRegistry.Specs()),
-		schemahcl.WithScopedEnums("table.column.as.type", stored, virtual),
-		schemahcl.WithScopedEnums("table.foreign_key.on_update", specutil.ReferenceVars...),
-		schemahcl.WithScopedEnums("table.foreign_key.on_delete", specutil.ReferenceVars...),
-	)
+	codec = &Codec{
+		State: schemahcl.New(append(
+			specOptions,
+			schemahcl.WithTypes("table.column.type", TypeRegistry.Specs()),
+			schemahcl.WithTypes("view.column.type", TypeRegistry.Specs()),
+			schemahcl.WithScopedEnums("table.column.as.type", stored, virtual),
+			schemahcl.WithScopedEnums("table.foreign_key.on_update", specutil.ReferenceVars...),
+			schemahcl.WithScopedEnums("table.foreign_key.on_delete", specutil.ReferenceVars...),
+		)...),
+	}
 	// MarshalHCL marshals v into an Atlas HCL DDL document.
-	MarshalHCL = schemahcl.MarshalerFunc(func(v any) ([]byte, error) {
-		return MarshalSpec(v, hclState)
-	})
+	MarshalHCL = schemahcl.MarshalerFunc(codec.MarshalSpec)
 	// EvalHCL implements the schemahcl.Evaluator interface.
-	EvalHCL = schemahcl.EvalFunc(evalSpec)
-
+	EvalHCL = schemahcl.EvalFunc(codec.Eval)
 	// EvalHCLBytes is a helper that evaluates an HCL document from a byte slice instead
 	// of from an hclparse.Parser instance.
 	EvalHCLBytes = specutil.HCLBytesFunc(EvalHCL)
@@ -218,9 +321,4 @@ func storedOrVirtual(s string) string {
 		return virtual
 	}
 	return s
-}
-
-type doc struct {
-	Tables  []*sqlspec.Table  `spec:"table"`
-	Schemas []*sqlspec.Schema `spec:"schema"`
 }

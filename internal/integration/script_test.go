@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -23,6 +24,7 @@ import (
 	"ariga.io/atlas/sql/mysql"
 	"ariga.io/atlas/sql/postgres"
 	"ariga.io/atlas/sql/schema"
+	"ariga.io/atlas/sql/sqlclient"
 	"ariga.io/atlas/sql/sqlite"
 
 	"github.com/pkg/diff"
@@ -82,6 +84,7 @@ func TestSQLite_Script(t *testing.T) {
 			"apply":       tt.cmdApply,
 			"exist":       tt.cmdExist,
 			"synced":      tt.cmdSynced,
+			"cmphcl":      tt.cmdCmpHCL,
 			"cmpshow":     tt.cmdCmpShow,
 			"cmpmig":      tt.cmdCmpMig,
 			"execsql":     tt.cmdExec,
@@ -101,7 +104,15 @@ func (t *myTest) setupScript(env *testscript.Env) error {
 	if err := replaceDBURL(env, t.url("")); err != nil {
 		return err
 	}
-	return setupScript(t.T, env, t.db, "DROP SCHEMA IF EXISTS %s")
+	return setupScript(env, t.db,
+		"CREATE SCHEMA IF NOT EXISTS %s",
+		"DROP SCHEMA IF EXISTS %s",
+		func(tt testing.TB, schema string) migrate.Driver {
+			dev, err := sqlclient.Open(context.Background(), fmt.Sprintf("mysql://root:pass@localhost:%d/%s", t.port, schema))
+			require.NoError(tt, err)
+			tt.Cleanup(func() { require.NoError(tt, dev.Close()) })
+			return dev.Driver
+		})
 }
 
 func replaceDBURL(env *testscript.Env, url string) error {
@@ -120,34 +131,55 @@ func (t *pgTest) setupScript(env *testscript.Env) error {
 	if err := replaceDBURL(env, u); err != nil {
 		return err
 	}
-	return setupScript(t.T, env, t.db, "DROP SCHEMA IF EXISTS %s CASCADE")
+	return setupScript(env, t.db,
+		"CREATE SCHEMA IF NOT EXISTS %s",
+		"DROP SCHEMA IF EXISTS %s CASCADE",
+		func(tt testing.TB, schema string) migrate.Driver {
+			dev, err := sqlclient.Open(context.Background(), fmt.Sprintf("postgres://postgres:pass@localhost:%d/test?search_path=%s&sslmode=disable", t.port, schema))
+			require.NoError(tt, err)
+			tt.Cleanup(func() { require.NoError(tt, dev.Close()) })
+			return dev.Driver
+		})
 }
 
-func setupScript(t *testing.T, env *testscript.Env, db *sql.DB, dropCmd string) error {
+func setupScript(env *testscript.Env, db *sql.DB, createCmd, dropCmd string, open func(testing.TB, string) migrate.Driver) error {
 	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
 	}
 	name := strings.ReplaceAll(filepath.Base(env.WorkDir), "-", "_")
+	devname := fmt.Sprintf("%s_dev", name)
 	env.Setenv("db", name)
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", name)); err != nil {
+	env.Setenv("dev", devname)
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf(createCmd, name)); err != nil {
 		return err
 	}
-	env.Defer(func() {
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf(createCmd, devname)); err != nil {
+		return err
+	}
+	// Env has a T() method that returns the *testing.T.
+	// We need to cast it to the testing.TB interface
+	// to be able to use the Cleanup method.
+	tt := env.T().(testing.TB)
+	tt.Cleanup(func() {
 		if _, err := conn.ExecContext(ctx, fmt.Sprintf(dropCmd, name)); err != nil {
-			t.Fatal(err)
+			tt.Fatal(err)
+		}
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf(dropCmd, devname)); err != nil {
+			tt.Fatal(err)
 		}
 		if err := conn.Close(); err != nil {
-			t.Fatal(err)
+			tt.Fatal(err)
 		}
 	})
+	// Dev-driver per testscript schema to allow concurrent tests.
+	env.Values["drv"] = open(tt, name)
+	env.Values["dev"] = open(tt, devname)
 	// Store the testscript.T for later use.
 	// See "only" function below.
 	env.Values[keyT] = env.T()
-	if err := setupCLITest(t, env); err != nil {
-		return err
-	}
+	env.Setenv(atlasPathKey, cliPath(tt))
 	return nil
 }
 
@@ -172,9 +204,7 @@ func (t *liteTest) setupScript(env *testscript.Env) error {
 	// environment as tests run in parallel.
 	env.Values[keyDB] = db
 	env.Values[keyDrv] = drv
-	if err := setupCLITest(t.T, env); err != nil {
-		return err
-	}
+	env.Setenv(atlasPathKey, cliPath(t.T))
 	// Set the workdir in the test atlas.hcl file.
 	projectFile := filepath.Join(env.WorkDir, "atlas.hcl")
 	if b, err := os.ReadFile(projectFile); err == nil {
@@ -182,15 +212,6 @@ func (t *liteTest) setupScript(env *testscript.Env) error {
 			fmt.Sprintf("sqlite://file:%s/atlas.sqlite?cache=shared&_fk=1", env.WorkDir))
 		return os.WriteFile(projectFile, []byte(rep), 0600)
 	}
-	return nil
-}
-
-func setupCLITest(t *testing.T, env *testscript.Env) error {
-	path, err := buildCmd(t)
-	if err != nil {
-		return err
-	}
-	env.Setenv(atlasPathKey, path)
 	return nil
 }
 
@@ -302,13 +323,13 @@ func cmdCmpShow(ts *testscript.TestScript, args []string, show func(schema, name
 	}
 	var sb strings.Builder
 	ts.Check(diff.Text("show", fname, t1, t2, &sb))
-	ts.Fatalf(sb.String())
+	ts.Fatalf("\n%s", sb.String())
 }
 
 func (t *myTest) cmdCmpHCL(ts *testscript.TestScript, _ bool, args []string) {
 	r := strings.NewReplacer("$charset", ts.Getenv("charset"), "$collate", ts.Getenv("collate"), "$db", ts.Getenv("db"))
 	cmdCmpHCL(ts, args, func(name string) (string, error) {
-		s, err := t.drv.InspectSchema(context.Background(), name, nil)
+		s, err := ts.Value("drv").(migrate.Driver).InspectSchema(context.Background(), name, nil)
 		ts.Check(err)
 		buf, err := mysql.MarshalHCL(s)
 		require.NoError(t, err)
@@ -320,9 +341,21 @@ func (t *myTest) cmdCmpHCL(ts *testscript.TestScript, _ bool, args []string) {
 
 func (t *pgTest) cmdCmpHCL(ts *testscript.TestScript, _ bool, args []string) {
 	cmdCmpHCL(ts, args, func(name string) (string, error) {
-		s, err := t.drv.InspectSchema(context.Background(), name, nil)
+		s, err := ts.Value("drv").(migrate.Driver).InspectSchema(context.Background(), name, nil)
 		ts.Check(err)
 		buf, err := postgres.MarshalHCL(s)
+		require.NoError(t, err)
+		return string(buf), nil
+	}, func(s string) string {
+		return strings.ReplaceAll(ts.ReadFile(s), "$db", ts.Getenv("db"))
+	})
+}
+
+func (t *liteTest) cmdCmpHCL(ts *testscript.TestScript, _ bool, args []string) {
+	cmdCmpHCL(ts, args, func(name string) (string, error) {
+		s, err := ts.Value(keyDrv).(migrate.Driver).InspectSchema(context.Background(), "main", nil)
+		ts.Check(err)
+		buf, err := sqlite.MarshalHCL(s)
 		require.NoError(t, err)
 		return string(buf), nil
 	}, func(s string) string {
@@ -355,7 +388,7 @@ func cmdCmpHCL(ts *testscript.TestScript, args []string, inspect func(schema str
 	}
 	var sb strings.Builder
 	ts.Check(diff.Text("inspect", fname, f1, f2, &sb))
-	ts.Fatalf(sb.String())
+	ts.Fatalf("\n%s", sb.String())
 }
 
 func (t *myTest) cmdExec(ts *testscript.TestScript, _ bool, args []string) {
@@ -371,25 +404,30 @@ func (t *liteTest) cmdExec(ts *testscript.TestScript, _ bool, args []string) {
 }
 
 func (t *myTest) cmdCLI(ts *testscript.TestScript, neg bool, args []string) {
-	cmdCLI(ts, neg, args, t.url(ts.Getenv("db")), ts.Getenv(atlasPathKey))
+	cmdCLI(ts, neg, args, t.url(ts.Getenv("db")), t.url(ts.Getenv("dev")), ts.Getenv(atlasPathKey))
 }
 
 func (t *pgTest) cmdCLI(ts *testscript.TestScript, neg bool, args []string) {
-	cmdCLI(ts, neg, args, t.url(ts.Getenv("db")), ts.Getenv(atlasPathKey))
+	cmdCLI(ts, neg, args, t.url(ts.Getenv("db")), t.url(ts.Getenv("dev")), ts.Getenv(atlasPathKey))
 }
 
 func (t *liteTest) cmdCLI(ts *testscript.TestScript, neg bool, args []string) {
 	dbURL := fmt.Sprintf("sqlite://file:%s/atlas.sqlite?cache=shared&_fk=1", ts.Getenv("WORK"))
-	cmdCLI(ts, neg, args, dbURL, ts.Getenv(atlasPathKey))
+	cmdCLI(ts, neg, args, dbURL, "sqlite://dev?mode=memory", ts.Getenv(atlasPathKey))
 }
 
-func cmdCLI(ts *testscript.TestScript, neg bool, args []string, dbURL, cliPath string) {
+func cmdCLI(ts *testscript.TestScript, neg bool, args []string, dbURL, devURL, cliPath string) {
 	var (
 		workDir = ts.Getenv("WORK")
-		r       = strings.NewReplacer("URL", dbURL, "$db", ts.Getenv("db"))
+		r       = strings.NewReplacer("URL", dbURL, "DEV_URL", devURL, "$db", ts.Getenv("db"))
 	)
 	for i, arg := range args {
 		args[i] = r.Replace(arg)
+	}
+	// Whenever a migrate diff/apply command is executed, increase the default lock
+	// timeout to 30s, as the default (10s) for synchronizing all our tests.
+	if len(args) > 1 && args[0] == "migrate" && (args[1] == "diff" || args[1] == "apply") && !slices.Contains(args, "--lock-timeout") {
+		args = append(args, "--lock-timeout", "30s")
 	}
 	switch l := len(args); {
 	// If command was run with a unix redirect-like suffix.
@@ -403,6 +441,7 @@ func cmdCLI(ts *testscript.TestScript, neg bool, args []string, dbURL, cliPath s
 		stderr := &bytes.Buffer{}
 		cmd.Stderr = stderr
 		cmd.Dir = workDir
+		cmd.Env = append(cmd.Env, "HOME="+ts.Getenv("HOME"))
 		if err := cmd.Run(); err != nil && !neg {
 			ts.Fatalf("\n[stderr]\n%s", stderr)
 		}
@@ -464,7 +503,7 @@ func cmdCmpMig(ts *testscript.TestScript, _ bool, args []string) {
 			if len(exLines) != len(acLines) {
 				var sb strings.Builder
 				ts.Check(diff.Text(f.Name(), args[1], expected, actual, &sb))
-				ts.Fatalf(sb.String())
+				ts.Fatalf("\n%s", sb.String())
 			}
 			for i := range exLines {
 				// Skip liquibase changeset comments since they contain a timestamp.
@@ -474,7 +513,7 @@ func cmdCmpMig(ts *testscript.TestScript, _ bool, args []string) {
 				if exLines[i] != acLines[i] {
 					var sb strings.Builder
 					ts.Check(diff.Text(f.Name(), args[1], expected, actual, &sb))
-					ts.Fatalf(sb.String())
+					ts.Fatalf("\n%s", sb.String())
 				}
 			}
 			return
@@ -545,7 +584,7 @@ func (t *myTest) cmdSynced(ts *testscript.TestScript, neg bool, args []string) {
 }
 
 func (t *myTest) cmdApply(ts *testscript.TestScript, neg bool, args []string) {
-	cmdApply(ts, neg, args, t.drv.ApplyChanges, t.hclDiff)
+	cmdApply(ts, neg, args, ts.Value("drv").(migrate.Driver).ApplyChanges, t.hclDiff)
 }
 
 func (t *myTest) hclDiff(ts *testscript.TestScript, name string) ([]schema.Change, error) {
@@ -553,18 +592,19 @@ func (t *myTest) hclDiff(ts *testscript.TestScript, name string) ([]schema.Chang
 		desired = &schema.Schema{}
 		f       = ts.ReadFile(name)
 		ctx     = context.Background()
+		drv     = ts.Value("drv").(migrate.Driver)
 		r       = strings.NewReplacer("$charset", ts.Getenv("charset"), "$collate", ts.Getenv("collate"), "$db", ts.Getenv("db"))
 	)
 	ts.Check(mysql.EvalHCLBytes([]byte(r.Replace(f)), desired, nil))
-	current, err := t.drv.InspectSchema(ctx, desired.Name, nil)
+	current, err := drv.InspectSchema(ctx, desired.Name, nil)
 	ts.Check(err)
-	desired, err = t.drv.(schema.Normalizer).NormalizeSchema(ctx, desired)
+	desired, err = ts.Value("dev").(schema.Normalizer).NormalizeSchema(ctx, desired)
 	// Normalization and diffing errors should
 	// be returned to the caller.
 	if err != nil {
 		return nil, err
 	}
-	changes, err := t.drv.SchemaDiff(current, desired)
+	changes, err := drv.SchemaDiff(current, desired)
 	if err != nil {
 		return nil, err
 	}
@@ -576,25 +616,26 @@ func (t *pgTest) cmdSynced(ts *testscript.TestScript, neg bool, args []string) {
 }
 
 func (t *pgTest) cmdApply(ts *testscript.TestScript, neg bool, args []string) {
-	cmdApply(ts, neg, args, t.drv.ApplyChanges, t.hclDiff)
+	cmdApply(ts, neg, args, ts.Value("drv").(migrate.Driver).ApplyChanges, t.hclDiff)
 }
 
 func (t *pgTest) hclDiff(ts *testscript.TestScript, name string) ([]schema.Change, error) {
 	var (
 		desired = &schema.Schema{}
 		ctx     = context.Background()
+		drv     = ts.Value("drv").(migrate.Driver)
 		f       = strings.ReplaceAll(ts.ReadFile(name), "$db", ts.Getenv("db"))
 	)
 	ts.Check(postgres.EvalHCLBytes([]byte(f), desired, nil))
-	current, err := t.drv.InspectSchema(ctx, desired.Name, nil)
+	current, err := drv.InspectSchema(ctx, desired.Name, nil)
 	ts.Check(err)
-	desired, err = t.drv.(schema.Normalizer).NormalizeSchema(ctx, desired)
+	desired, err = ts.Value("dev").(schema.Normalizer).NormalizeSchema(ctx, desired)
 	// Normalization and diffing errors should
 	// be returned to the caller.
 	if err != nil {
 		return nil, err
 	}
-	changes, err := t.drv.SchemaDiff(current, desired)
+	changes, err := drv.SchemaDiff(current, desired)
 	if err != nil {
 		return nil, err
 	}

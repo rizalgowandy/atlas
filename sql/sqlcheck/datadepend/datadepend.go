@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"ariga.io/atlas/schemahcl"
 	"ariga.io/atlas/sql/internal/sqlx"
@@ -87,22 +89,27 @@ func (a *Analyzer) Diagnostics(_ context.Context, p *sqlcheck.Pass) (diags []sql
 			for _, c := range m.Changes {
 				switch c := c.(type) {
 				case *schema.AddIndex:
-					column := func() *schema.Column {
+					names := func() []string {
+						var names []string
 						for i := range c.I.Parts {
 							// We consider a column a non-new column if
 							// it was not added in this migration file.
 							if column := c.I.Parts[i].C; column != nil && p.File.ColumnSpan(m.T, column)&sqlcheck.SpanAdded == 0 {
-								return column
+								names = append(names, fmt.Sprintf("%q", column.Name))
 							}
 						}
-						return nil
+						return names
 					}()
-					// A unique index was added on an existing column.
-					if c.I.Unique && column != nil {
+					// A unique index was added on an existing columns.
+					if c.I.Unique && len(names) > 0 {
+						s := fmt.Sprintf("columns %s contain", strings.Join(names, ", "))
+						if len(names) == 1 {
+							s = fmt.Sprintf("column %s contains", names[0])
+						}
 						diags = append(diags, sqlcheck.Diagnostic{
 							Code: codeAddUniqueI,
 							Pos:  sc.Stmt.Pos,
-							Text: fmt.Sprintf("Adding a unique index %q on table %q might fail in case column %q contains duplicate entries", c.I.Name, m.T.Name, column.Name),
+							Text: fmt.Sprintf("Adding a unique index %q on table %q might fail in case %s duplicate entries", c.I.Name, m.T.Name, s),
 						})
 					}
 				case *schema.ModifyIndex:
@@ -131,7 +138,7 @@ func (a *Analyzer) Diagnostics(_ context.Context, p *sqlcheck.Pass) (diags []sql
 					}
 				case *schema.ModifyColumn:
 					switch {
-					case p.File.TableSpan(m.T)&sqlcheck.SpanAdded == 1 || !(c.From.Type.Null && !c.To.Type.Null):
+					case p.File.TableSpan(m.T)&sqlcheck.SpanAdded == 1 || !(c.From.Type.Null && !c.To.Type.Null) || HasNotNullCheck(p, c.From):
 					case a.ModifyNotNull != nil:
 						d, err := a.Handler.ModifyNotNull(&ColumnPass{Pass: p, Change: sc, Table: m.T, Column: c.To})
 						if err != nil {
@@ -146,7 +153,7 @@ func (a *Analyzer) Diagnostics(_ context.Context, p *sqlcheck.Pass) (diags []sql
 						diags = append(diags, d...)
 					// In case the altered column was not added in this file, and the column
 					// was changed nullable to non-nullable without back filling it with values.
-					case !ColumnFilled(p.File, m.T, c.From, sc.Stmt.Pos):
+					case !ColumnFilled(p, m.T, c.From, sc.Stmt.Pos):
 						diags = append(diags, sqlcheck.Diagnostic{
 							Code: codeModNotNullC,
 							Pos:  sc.Stmt.Pos,
@@ -175,15 +182,36 @@ func (a *Analyzer) Report(p *sqlcheck.Pass, diags []sqlcheck.Diagnostic) error {
 }
 
 // ColumnFilled checks if the column was filled with values before the given position.
-func ColumnFilled(f *sqlcheck.File, t *schema.Table, c *schema.Column, pos int) bool {
+func ColumnFilled(p *sqlcheck.Pass, t *schema.Table, c *schema.Column, pos int) bool {
 	// The parser used for parsing this file can check if the
 	// given nullable column was filled before the given position.
-	p, ok := f.Parser.(interface {
-		ColumnFilledBefore(migrate.File, *schema.Table, *schema.Column, int) (bool, error)
+	pr, ok := p.File.Parser.(interface {
+		ColumnFilledBefore([]*migrate.Stmt, *schema.Table, *schema.Column, int) (bool, error)
 	})
 	if !ok {
 		return false
 	}
-	filled, _ := p.ColumnFilledBefore(f, t, c, pos)
+	stmts, err := migrate.FileStmtDecls(p.Dev, p.File)
+	if err != nil {
+		return false
+	}
+	filled, _ := pr.ColumnFilledBefore(stmts, t, c, pos)
 	return filled
+}
+
+// HasNotNullCheck checks if the given column has a check constraint with a NOT NULL check.
+// In case a CHECK exists, this reduces the risk for data-depend conflicts when changing
+// a nullable column to non-nullable.
+func HasNotNullCheck(p *sqlcheck.Pass, c *schema.Column) bool {
+	pr, ok := p.File.Parser.(interface {
+		CheckNotNullFor(*schema.Check, string) (bool, error)
+	})
+	return ok && slices.ContainsFunc(c.Attrs, func(a schema.Attr) bool {
+		ck, ok := a.(*schema.Check)
+		if !ok {
+			return false
+		}
+		v, err := pr.CheckNotNullFor(ck, c.Name)
+		return err == nil && v
+	})
 }

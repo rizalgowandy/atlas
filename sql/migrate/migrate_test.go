@@ -23,24 +23,18 @@ import (
 
 func TestRevisionType_MarshalText(t *testing.T) {
 	for _, tt := range []struct {
-		r       migrate.RevisionType
-		ex      string
-		wantErr bool
+		r  migrate.RevisionType
+		ex string
 	}{
-		{migrate.RevisionTypeUnknown, "", true},
-		{migrate.RevisionTypeBaseline, "baseline", false},
-		{migrate.RevisionTypeExecute, "applied", false},
-		{migrate.RevisionTypeResolved, "manually set", false},
-		{migrate.RevisionTypeExecute | migrate.RevisionTypeResolved, "applied + manually set", false},
-		{migrate.RevisionTypeExecute | migrate.RevisionTypeBaseline, "", true},
-		{1 << 3, "", true},
+		{migrate.RevisionTypeUnknown, "unknown (0000)"},
+		{migrate.RevisionTypeBaseline, "baseline"},
+		{migrate.RevisionTypeExecute, "applied"},
+		{migrate.RevisionTypeResolved, "manually set"},
+		{migrate.RevisionTypeExecute | migrate.RevisionTypeResolved, "applied + manually set"},
+		{migrate.RevisionTypeExecute | migrate.RevisionTypeBaseline, "unknown (0011)"},
+		{1 << 3, "unknown (1000)"},
 	} {
 		ac, err := tt.r.MarshalText()
-		if tt.wantErr {
-			require.Error(t, err)
-			require.Zero(t, ac)
-			continue
-		}
 		require.NoError(t, err)
 		require.Equal(t, tt.ex, string(ac))
 	}
@@ -80,6 +74,41 @@ func TestPlanner_WritePlan(t *testing.T) {
 	require.Equal(t, countFiles(t, d), 3)
 	requireFileEqual(t, d, "add_t1_and_t2.up.sql", "CREATE TABLE t1(c int)\nCREATE TABLE t2(c int)\n")
 	requireFileEqual(t, d, "add_t1_and_t2.down.sql", "DROP TABLE t1 IF EXISTS\nDROP TABLE t2\n")
+
+	// With custom delimiter.
+	plan.Delimiter = "\nGO"
+	pl = migrate.NewPlanner(nil, d, migrate.PlanWithChecksum(false))
+	require.NotNil(t, pl)
+	require.NoError(t, pl.WritePlan(plan))
+	v = time.Now().UTC().Format("20060102150405")
+	require.Equal(t, countFiles(t, d), 3)
+	requireFileEqual(t, d, v+"_add_t1_and_t2.sql", "-- atlas:delimiter \\nGO\n\nCREATE TABLE t1(c int)\nGO\nCREATE TABLE t2(c int)\nGO\n")
+}
+
+func TestPlanner_WriteCheckpoint(t *testing.T) {
+	p := t.TempDir()
+	d, err := migrate.NewLocalDir(p)
+	require.NoError(t, err)
+	plan := &migrate.Plan{
+		Name: "checkpoint",
+		Changes: []*migrate.Change{
+			{Cmd: "CREATE TABLE t1(c int)", Reverse: "DROP TABLE t1 IF EXISTS"},
+			{Cmd: "CREATE TABLE t2(c int)", Reverse: "DROP TABLE t2"},
+		},
+	}
+
+	// DefaultFormatter
+	pl := migrate.NewPlanner(nil, d)
+	require.NotNil(t, pl)
+	require.NoError(t, pl.WriteCheckpoint(plan, "v1"))
+	files, err := d.Files()
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	require.Equal(t, `-- atlas:checkpoint v1
+
+CREATE TABLE t1(c int);
+CREATE TABLE t2(c int);
+`, string(files[0].Bytes()))
 }
 
 func TestPlanner_Plan(t *testing.T) {
@@ -145,6 +174,56 @@ func TestPlanner_PlanSchema(t *testing.T) {
 	require.Nil(t, plan)
 }
 
+func TestPlanner_Checkpoint(t *testing.T) {
+	var (
+		drv = &mockDriver{}
+		ctx = context.Background()
+	)
+	d, err := migrate.NewLocalDir(t.TempDir())
+	require.NoError(t, err)
+
+	// Nothing to do.
+	pl := migrate.NewPlanner(drv, d)
+	plan, err := pl.Checkpoint(ctx, "empty")
+	require.NoError(t, err)
+	require.Equal(t, &migrate.Plan{Name: "empty"}, plan)
+
+	// There are changes.
+	drv.changes = []schema.Change{
+		&schema.AddTable{T: schema.NewTable("t1").AddColumns(schema.NewIntColumn("c", "int"))},
+		&schema.AddTable{T: schema.NewTable("t2").AddColumns(schema.NewIntColumn("c", "int"))},
+	}
+	drv.plan = &migrate.Plan{
+		Changes: []*migrate.Change{
+			{Cmd: "CREATE TABLE t1(c int);"},
+			{Cmd: "CREATE TABLE t2(c int);"},
+		},
+	}
+	plan, err = pl.Checkpoint(ctx, "checkpoint")
+	require.NoError(t, err)
+	require.Equal(t, drv.plan, plan)
+}
+
+func TestPlanner_CheckpointSchema(t *testing.T) {
+	var (
+		drv = &mockDriver{}
+		ctx = context.Background()
+	)
+	d, err := migrate.NewLocalDir(t.TempDir())
+	require.NoError(t, err)
+
+	// Schema is missing in dev connection.
+	pl := migrate.NewPlanner(drv, d)
+	plan, err := pl.CheckpointSchema(ctx, "empty")
+	require.EqualError(t, err, `not found`)
+	require.Nil(t, plan)
+
+	drv.realm = *schema.NewRealm(schema.New("test"))
+	pl = migrate.NewPlanner(drv, d)
+	plan, err = pl.CheckpointSchema(ctx, "empty")
+	require.Equal(t, &migrate.Plan{Name: "empty"}, plan)
+}
+
 func TestExecutor_Replay(t *testing.T) {
 	ctx := context.Background()
 	d, err := migrate.NewLocalDir(filepath.FromSlash("testdata/migrate"))
@@ -188,11 +267,51 @@ func TestExecutor_Replay(t *testing.T) {
 	drv.dirty = true
 	drv.realm = schema.Realm{Schemas: []*schema.Schema{{Name: "schema"}}}
 	_, err = ex.Replay(ctx, migrate.RealmConn(drv, nil))
-	require.ErrorAs(t, err, &migrate.NotCleanError{})
+	require.ErrorAs(t, err, new(*migrate.NotCleanError))
+
+	// Replay before/after checkpoint.
+	mem := &migrate.MemDir{}
+	require.NoError(t,
+		mem.CopyFiles([]migrate.File{
+			migrate.NewLocalFile("1.sql", []byte("CREATE TABLE t1(c int);")),
+			migrate.NewLocalFile("2.sql", []byte("CREATE TABLE t2(c int);")),
+			migrate.NewLocalFile("3_checkpoint.sql", []byte("-- atlas:checkpoint v1\n\nCREATE TABLE t1(c int);\nCREATE TABLE t2(c int);")),
+			migrate.NewLocalFile("4.sql", []byte("CREATE TABLE t3(c int);")),
+		}),
+	)
+	for v, stmts := range map[string][]string{
+		"1": {"CREATE TABLE t1(c int);"},
+		"2": {"CREATE TABLE t1(c int);", "CREATE TABLE t2(c int);"},
+		"3": {"CREATE TABLE t1(c int);", "CREATE TABLE t2(c int);"},
+		"4": {"CREATE TABLE t1(c int);", "CREATE TABLE t2(c int);", "CREATE TABLE t3(c int);"},
+	} {
+		*drv = mockDriver{}
+		ex, err = migrate.NewExecutor(drv, mem, migrate.NopRevisionReadWriter{})
+		require.NoError(t, err)
+		_, err = ex.Replay(ctx, migrate.RealmConn(drv, nil), migrate.ReplayToVersion(v))
+		require.NoError(t, err)
+		require.Equalf(t, stmts, drv.executed, "mismatch at version %s", v)
+	}
+
+	// ExecuteTo in steps.
+	*drv = mockDriver{}
+	ex, err = migrate.NewExecutor(drv, mem, &mockRevisionReadWriter{})
+	require.NoError(t, err)
+	require.NoError(t, ex.ExecuteTo(ctx, "1"))
+	require.Equal(t, []string{"CREATE TABLE t1(c int);"}, drv.executed)
+	require.ErrorIs(t, ex.ExecuteTo(ctx, "1"), migrate.ErrNoPendingFiles)
+	require.NoError(t, ex.ExecuteTo(ctx, "2"))
+	require.Equal(t, []string{"CREATE TABLE t1(c int);", "CREATE TABLE t2(c int);"}, drv.executed)
+	require.ErrorIs(t, ex.ExecuteTo(ctx, "1"), migrate.ErrNoPendingFiles)
+	require.ErrorIs(t, ex.ExecuteTo(ctx, "2"), migrate.ErrNoPendingFiles)
+	require.NoError(t, ex.ExecuteTo(ctx, "4"))
+	require.Equal(t, []string{"CREATE TABLE t1(c int);", "CREATE TABLE t2(c int);", "CREATE TABLE t3(c int);"}, drv.executed)
+	require.ErrorIs(t, ex.ExecuteTo(ctx, "4"), migrate.ErrNoPendingFiles)
 }
 
 func TestExecutor_Pending(t *testing.T) {
 	var (
+		ctx  = context.Background()
 		drv  = &mockDriver{}
 		rrw  = &mockRevisionReadWriter{}
 		log  = &mockLogger{}
@@ -219,96 +338,229 @@ func TestExecutor_Pending(t *testing.T) {
 			Hash:        "+O40cAXHgvMClnynHd5wggPAeZAk7zSEaNgzXCZOfmY=",
 		}
 	)
-	dir, err := migrate.NewLocalDir(filepath.Join("testdata/migrate", "sub"))
+	dir, err := migrate.NewLocalDir(filepath.Join("testdata", "migrate", "sub"))
 	require.NoError(t, err)
 	ex, err := migrate.NewExecutor(drv, dir, rrw, migrate.WithLogger(log))
 	require.NoError(t, err)
 
 	// All are pending
-	p, err := ex.Pending(context.Background())
+	p, err := ex.Pending(ctx)
 	require.NoError(t, err)
 	require.Len(t, p, 3)
 
 	// 2 are pending.
 	*rrw = []*migrate.Revision{rev1}
-	p, err = ex.Pending(context.Background())
+	p, err = ex.Pending(ctx)
 	require.NoError(t, err)
 	require.Len(t, p, 2)
 
 	// Only the last one is pending (in full).
 	*rrw = []*migrate.Revision{rev1, rev2}
-	p, err = ex.Pending(context.Background())
+	p, err = ex.Pending(ctx)
 	require.NoError(t, err)
 	require.Len(t, p, 1)
 
 	// First statement of last one is marked as applied, second isn't. Third file is still pending.
 	*rrw = []*migrate.Revision{rev1, rev2, rev3}
-	p, err = ex.Pending(context.Background())
+	p, err = ex.Pending(ctx)
 	require.NoError(t, err)
 	require.Len(t, p, 1)
 
 	// Nothing to do if all migrations are applied.
 	rev3.Applied = rev3.Total
 	*rrw = []*migrate.Revision{rev1, rev2, rev3}
-	p, err = ex.Pending(context.Background())
+	p, err = ex.Pending(ctx)
 	require.ErrorIs(t, err, migrate.ErrNoPendingFiles)
 	require.Len(t, p, 0)
 
 	// If there is a revision in the past with no existing migration, we don't care.
 	rev3.Applied = rev3.Total
 	*rrw = []*migrate.Revision{{Version: "2.11"}, rev3}
-	p, err = ex.Pending(context.Background())
+	p, err = ex.Pending(ctx)
 	require.ErrorIs(t, err, migrate.ErrNoPendingFiles)
 	require.Len(t, p, 0)
 
 	// If only the last migration file is applied, we expect there are no pending files.
 	*rrw = []*migrate.Revision{rev3}
-	p, err = ex.Pending(context.Background())
+	p, err = ex.Pending(ctx)
 	require.ErrorIs(t, err, migrate.ErrNoPendingFiles)
 	require.Len(t, p, 0)
 
 	// If the last applied revision has no matching migration file, and the last
 	// migration version precedes that revision, there is nothing to do.
 	*rrw = []*migrate.Revision{{Version: "5"}}
-	p, err = ex.Pending(context.Background())
+	p, err = ex.Pending(ctx)
 	require.ErrorIs(t, err, migrate.ErrNoPendingFiles)
 	require.Len(t, p, 0)
 
 	// The applied revision precedes every migration file. Expect all files pending.
 	*rrw = []*migrate.Revision{{Version: "1.1"}}
-	p, err = ex.Pending(context.Background())
+	p, err = ex.Pending(ctx)
 	require.NoError(t, err)
 	require.Len(t, p, 3)
 
 	// All except one file are applied. The latest revision does not exist and its version is smaller than the last
 	// migration file. Expect the last file pending.
 	*rrw = []*migrate.Revision{rev1, rev2, {Version: "2.11"}}
-	p, err = ex.Pending(context.Background())
+	p, err = ex.Pending(ctx)
 	require.NoError(t, err)
 	require.Len(t, p, 1)
 	require.Equal(t, rev3.Version, p[0].Version())
 
 	// If the last revision is partially applied and the matching migration file does not exist, we have a problem.
 	*rrw = []*migrate.Revision{{Version: "deleted", Description: "desc", Total: 1}}
-	p, err = ex.Pending(context.Background())
+	p, err = ex.Pending(ctx)
 	require.EqualError(t, err, migrate.MissingMigrationError{Version: "deleted", Description: "desc"}.Error())
 	require.Len(t, p, 0)
+
+	// If the last revision is a partially applied checkpoint, expect it to be part of
+	// the pending files. Checkpoint files following the failed one are not included.
+	dir, err = migrate.NewLocalDir(filepath.Join("testdata", "partial-checkpoint"))
+	require.NoError(t, err)
+	ex, err = migrate.NewExecutor(drv, dir, rrw, migrate.WithLogger(log))
+	require.NoError(t, err)
+	*rrw = []*migrate.Revision{{Version: "3", Description: "checkpoint", Total: 2, Applied: 1}}
+	p, err = ex.Pending(ctx)
+	require.NoError(t, err)
+	require.Len(t, p, 3)
+	require.Equal(t, "3", p[0].Version())
+	require.Equal(t, "4", p[1].Version())
+	require.Equal(t, "6", p[2].Version())
+}
+
+func TestExecutor_ExecOrderLinear(t *testing.T) {
+	var (
+		drv = &mockDriver{}
+		ctx = context.Background()
+		rrw = &mockRevisionReadWriter{{Version: "1"}, {Version: "2"}, {Version: "3"}}
+		dir = func(names ...string) migrate.Dir {
+			m := &migrate.MemDir{}
+			for _, n := range names {
+				require.NoError(t, m.WriteFile(n, nil))
+			}
+			h, err := m.Checksum()
+			require.NoError(t, err)
+			require.NoError(t, migrate.WriteSumFile(m, h))
+			return m
+		}
+	)
+	t.Run("Linear", func(t *testing.T) {
+		ex, err := migrate.NewExecutor(drv, dir(), rrw)
+		require.NoError(t, err)
+		files, err := ex.Pending(ctx)
+		require.ErrorIs(t, err, migrate.ErrNoPendingFiles)
+		require.Empty(t, files)
+
+		ex, err = migrate.NewExecutor(drv, dir("1.sql", "2.sql", "3.sql"), rrw)
+		require.NoError(t, err)
+		files, err = ex.Pending(ctx)
+		require.ErrorIs(t, err, migrate.ErrNoPendingFiles)
+		require.Empty(t, files)
+
+		ex, err = migrate.NewExecutor(drv, dir("1.sql", "2.sql", "2.5.sql", "3.sql"), rrw)
+		require.NoError(t, err)
+		files, err = ex.Pending(ctx)
+		require.ErrorAs(t, err, new(*migrate.HistoryNonLinearError))
+		require.EqualError(t, err, "migration file 2.5.sql was added out of order. See: https://atlasgo.io/versioned/apply#non-linear-error")
+
+		ex, err = migrate.NewExecutor(drv, dir("1.sql", "2.sql", "2.5.sql", "2.6.sql", "3.sql"), rrw)
+		require.NoError(t, err)
+		files, err = ex.Pending(ctx)
+		require.ErrorAs(t, err, new(*migrate.HistoryNonLinearError))
+		require.EqualError(t, err, "migration files 2.5.sql, 2.6.sql were added out of order. See: https://atlasgo.io/versioned/apply#non-linear-error")
+
+		// The first file executed as checkpoint, therefore, 1.sql is not pending nor skipped.
+		rrw = &mockRevisionReadWriter{{Version: "2"}, {Version: "3"}}
+		ex, err = migrate.NewExecutor(drv, dir("1.sql", "2_checkpoint.sql", "3.sql"), rrw)
+		require.NoError(t, err)
+		files, err = ex.Pending(ctx)
+		require.ErrorIs(t, err, migrate.ErrNoPendingFiles)
+		require.Empty(t, files)
+
+		// The first file executed as checkpoint, therefore, 1.sql is not pending nor skipped.
+		rrw = &mockRevisionReadWriter{{Version: "2"}, {Version: "3"}}
+		ex, err = migrate.NewExecutor(drv, dir("1.sql", "2_checkpoint.sql", "2.5.sql", "3.sql"), rrw)
+		require.NoError(t, err)
+		files, err = ex.Pending(ctx)
+		require.ErrorAs(t, err, new(*migrate.HistoryNonLinearError))
+		require.EqualError(t, err, "migration file 2.5.sql was added out of order. See: https://atlasgo.io/versioned/apply#non-linear-error")
+	})
+
+	t.Run("LinearSkipped", func(t *testing.T) {
+		ex, err := migrate.NewExecutor(drv, dir(), rrw, migrate.WithExecOrder(migrate.ExecOrderLinearSkip))
+		require.NoError(t, err)
+		files, err := ex.Pending(ctx)
+		require.ErrorIs(t, err, migrate.ErrNoPendingFiles)
+		require.Empty(t, files)
+
+		ex, err = migrate.NewExecutor(drv, dir("1.sql", "2.sql", "3.sql"), rrw, migrate.WithExecOrder(migrate.ExecOrderLinearSkip))
+		require.NoError(t, err)
+		files, err = ex.Pending(ctx)
+		require.ErrorIs(t, err, migrate.ErrNoPendingFiles)
+		require.Empty(t, files)
+
+		// File 2.5.sql is skipped.
+		ex, err = migrate.NewExecutor(drv, dir("1.sql", "2.sql", "2.5.sql", "3.sql"), rrw, migrate.WithExecOrder(migrate.ExecOrderLinearSkip))
+		require.NoError(t, err)
+		files, err = ex.Pending(ctx)
+		require.ErrorIs(t, err, migrate.ErrNoPendingFiles)
+		require.Empty(t, files)
+
+		// Files 2.5.sql and 2.6.sql are skipped.
+		ex, err = migrate.NewExecutor(drv, dir("1.sql", "2.sql", "2.5.sql", "2.6.sql", "3.sql"), rrw, migrate.WithExecOrder(migrate.ExecOrderLinearSkip))
+		require.NoError(t, err)
+		files, err = ex.Pending(ctx)
+		require.ErrorIs(t, err, migrate.ErrNoPendingFiles)
+		require.Empty(t, files)
+	})
+
+	t.Run("NonLinear", func(t *testing.T) {
+		ex, err := migrate.NewExecutor(drv, dir(), rrw, migrate.WithExecOrder(migrate.ExecOrderNonLinear))
+		require.NoError(t, err)
+		files, err := ex.Pending(ctx)
+		require.ErrorIs(t, err, migrate.ErrNoPendingFiles)
+		require.Empty(t, files)
+
+		ex, err = migrate.NewExecutor(drv, dir("1.sql", "2.sql", "3.sql"), rrw, migrate.WithExecOrder(migrate.ExecOrderNonLinear))
+		require.NoError(t, err)
+		files, err = ex.Pending(ctx)
+		require.ErrorIs(t, err, migrate.ErrNoPendingFiles)
+		require.Empty(t, files)
+
+		// File 2.5.sql is pending.
+		ex, err = migrate.NewExecutor(drv, dir("1.sql", "2.sql", "2.5.sql", "3.sql"), rrw, migrate.WithExecOrder(migrate.ExecOrderNonLinear))
+		require.NoError(t, err)
+		files, err = ex.Pending(ctx)
+		require.NoError(t, err)
+		require.Len(t, files, 1)
+		require.Equal(t, "2.5.sql", files[0].Name())
+
+		// Files 2.5.sql, 2.6.sql and 4.sql are pending.
+		ex, err = migrate.NewExecutor(drv, dir("1.sql", "2.sql", "2.5.sql", "2.6.sql", "3.sql", "4.sql"), rrw, migrate.WithExecOrder(migrate.ExecOrderNonLinear))
+		require.NoError(t, err)
+		files, err = ex.Pending(ctx)
+		require.NoError(t, err)
+		require.Len(t, files, 3)
+		require.Equal(t, "2.5.sql", files[0].Name())
+		require.Equal(t, "2.6.sql", files[1].Name())
+		require.Equal(t, "4.sql", files[2].Name())
+	})
 }
 
 func TestExecutor(t *testing.T) {
 	// Passing nil raises error.
 	ex, err := migrate.NewExecutor(nil, nil, nil)
-	require.EqualError(t, err, "sql/migrate: execute: no driver given")
+	require.EqualError(t, err, "sql/migrate: no driver given")
 	require.Nil(t, ex)
 
 	ex, err = migrate.NewExecutor(&mockDriver{}, nil, nil)
-	require.EqualError(t, err, "sql/migrate: execute: no dir given")
+	require.EqualError(t, err, "sql/migrate: no dir given")
 	require.Nil(t, ex)
 
 	dir, err := migrate.NewLocalDir(t.TempDir())
 	require.NoError(t, err)
 	ex, err = migrate.NewExecutor(&mockDriver{}, dir, nil)
-	require.EqualError(t, err, "sql/migrate: execute: no revision storage given")
+	require.EqualError(t, err, "sql/migrate: no revision storage given")
 	require.Nil(t, ex)
 
 	// Does not operate on invalid migration dir.
@@ -319,7 +571,7 @@ func TestExecutor(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, ex)
 	require.ErrorIs(t, ex.ExecuteN(context.Background(), 0), migrate.ErrChecksumMismatch)
-	require.ErrorIs(t, ex.ExecuteTo(context.Background(), ""), migrate.ErrChecksumMismatch)
+	require.EqualError(t, ex.ExecuteTo(context.Background(), "1"), `sql/migrate: migration with version "1" not found`)
 
 	// Prerequisites.
 	var (
@@ -363,10 +615,19 @@ func TestExecutor(t *testing.T) {
 	require.Equal(t, "1.a_sub.up.sql", (*log)[0].(migrate.LogExecution).Files[0].Name())
 	require.Equal(t, "2.10.x-20_description.sql", (*log)[0].(migrate.LogExecution).Files[1].Name())
 	require.IsType(t, migrate.LogFile{}, (*log)[1])
-	require.Equal(t, migrate.LogStmt{SQL: "CREATE TABLE t_sub(c int);"}, (*log)[2])
-	require.Equal(t, migrate.LogStmt{SQL: "ALTER TABLE t_sub ADD c1 int;"}, (*log)[3])
+	require.Equal(t, migrate.LogStmt{
+		SQL:  "CREATE TABLE t_sub(c int);",
+		Stmt: &migrate.Stmt{Pos: 24, Text: "CREATE TABLE t_sub(c int);", Comments: []string{"-- create table \"t_sub\"\n"}},
+	}, (*log)[2])
+	require.Equal(t, migrate.LogStmt{
+		SQL:  "ALTER TABLE t_sub ADD c1 int;",
+		Stmt: &migrate.Stmt{Pos: 68, Text: "ALTER TABLE t_sub ADD c1 int;", Comments: []string{"-- add c1 column\n"}},
+	}, (*log)[3])
 	require.IsType(t, migrate.LogFile{}, (*log)[4])
-	require.Equal(t, migrate.LogStmt{SQL: "ALTER TABLE t_sub ADD c2 int;"}, (*log)[5])
+	require.Equal(t, migrate.LogStmt{
+		SQL:  "ALTER TABLE t_sub ADD c2 int;",
+		Stmt: &migrate.Stmt{Pos: 17, Text: "ALTER TABLE t_sub ADD c2 int;", Comments: []string{"-- add c2 column\n"}},
+	}, (*log)[5])
 	require.Equal(t, migrate.LogDone{}, (*log)[6])
 
 	// Partly is pending.
@@ -437,6 +698,7 @@ func TestExecutor(t *testing.T) {
 	*drv = mockDriver{}
 	require.NoError(t, ex.ExecuteN(context.Background(), 1))
 	require.Equal(t, []string{"ALTER TABLE t_sub ADD c4 int;"}, drv.executed)
+	require.Nil(t, revs[len(revs)-1].PartialHashes) // cleared our on successful apply
 
 	// Everything is applied.
 	require.ErrorIs(t, ex.ExecuteN(context.Background(), 0), migrate.ErrNoPendingFiles)
@@ -444,9 +706,68 @@ func TestExecutor(t *testing.T) {
 	// Test ExecuteTo.
 	*rrw = []*migrate.Revision{}
 	*drv = mockDriver{}
-	require.EqualError(t, ex.ExecuteTo(context.Background(), ""), "sql/migrate: execute: migration with version \"\" not found")
+	require.EqualError(t, ex.ExecuteTo(context.Background(), ""), "sql/migrate: migration with version \"\" not found")
 	require.NoError(t, ex.ExecuteTo(context.Background(), "2.10.x-20"))
 	requireEqualRevisions(t, []*migrate.Revision{rev1, rev2}, *rrw)
+
+	// Failed storing initial revision state in the database.
+	log = &mockLogger{}
+	*rrw = []*migrate.Revision{}
+	ex, err = migrate.NewExecutor(
+		&mockDriver{}, dir,
+		&mockWriteRevisionError{
+			mockRevisionReadWriter: *rrw,
+			errinit:                errors.New("init error"),
+		},
+		migrate.WithLogger(log),
+	)
+	require.NoError(t, err)
+	err = ex.ExecuteTo(context.Background(), "2.10.x-20")
+	require.EqualError(t, err, `sql/migrate: write revision: init error`)
+	require.Len(t, *log, 2, "fail on init")
+	require.IsType(t, migrate.LogExecution{}, (*log)[0])
+	require.IsType(t, migrate.LogError{}, (*log)[1])
+	e1 := (*log)[1].(migrate.LogError)
+	require.EqualError(t, e1.Error, `sql/migrate: write revision: init error`)
+
+	// Failed storing applied revision state in the database.
+	log = &mockLogger{}
+	*rrw = []*migrate.Revision{}
+	ex, err = migrate.NewExecutor(
+		&mockDriver{}, dir,
+		&mockWriteRevisionError{
+			mockRevisionReadWriter: *rrw,
+			errdone:                errors.New("done error"),
+		},
+		migrate.WithLogger(log),
+	)
+	require.NoError(t, err)
+	err = ex.ExecuteTo(context.Background(), "2.10.x-20")
+	require.EqualError(t, err, `sql/migrate: write revision: done error`)
+	// Logs are: Intro/Execution, File, 2 Stmts (1.a_sub.up.sql),
+	// and Error when writing the revision of the first file.
+	require.Len(t, *log, 5, "expect 5 logs to be fired")
+	require.IsType(t, migrate.LogExecution{}, (*log)[0])
+	require.IsType(t, migrate.LogFile{}, (*log)[1])
+	require.IsType(t, migrate.LogStmt{}, (*log)[2])
+	require.IsType(t, migrate.LogStmt{}, (*log)[3])
+	e1 = (*log)[4].(migrate.LogError)
+	require.EqualError(t, e1.Error, `sql/migrate: write revision: done error`)
+	require.EqualError(t, errors.Unwrap(e1.Error), `done error`)
+
+	// Successful retry should reset the error.
+	mem := &migrate.MemDir{}
+	require.NoError(t, mem.WriteFile("1.sql", []byte("CREATE TABLE t(c int);")))
+	sum, err := mem.Checksum()
+	require.NoError(t, err)
+	require.NoError(t, migrate.WriteSumFile(mem, sum))
+	*rrw = []*migrate.Revision{{Version: "1", Error: "error", ErrorStmt: ";CREATE TABLE t(c int);", Applied: 0, Total: 1}}
+	ex, err = migrate.NewExecutor(&mockDriver{}, mem, rrw, migrate.WithLogger(log))
+	require.NoError(t, err)
+	err = ex.ExecuteTo(context.Background(), "1")
+	require.NoError(t, err)
+	require.Empty(t, (*rrw)[0].Error)
+	require.Empty(t, (*rrw)[0].ErrorStmt)
 }
 
 func TestExecutor_Baseline(t *testing.T) {
@@ -494,43 +815,6 @@ func TestExecutor_Baseline(t *testing.T) {
 	require.Equal(t, migrate.RevisionTypeBaseline, rrw[0].Type)
 }
 
-func TestExecutor_FromVersion(t *testing.T) {
-	var (
-		drv = &mockDriver{}
-		log = &mockLogger{}
-		rrw = &mockRevisionReadWriter{
-			{
-				Version:     "1.a",
-				Description: "sub.up",
-				Applied:     2,
-				Total:       2,
-				Hash:        "nXyZR020M/mH7LxkoTkJr7BcQkipVg90imQ9I4595dw=",
-			},
-		}
-	)
-	dir, err := migrate.NewLocalDir(filepath.Join("testdata/migrate", "sub"))
-	require.NoError(t, err)
-	ex, err := migrate.NewExecutor(drv, dir, rrw, migrate.WithLogger(log))
-	require.NoError(t, err)
-	files, err := ex.Pending(context.Background())
-	require.NoError(t, err)
-	require.Len(t, files, 2)
-
-	// Control the starting point.
-	ex, err = migrate.NewExecutor(drv, dir, rrw, migrate.WithLogger(log), migrate.WithFromVersion("3"))
-	require.NoError(t, err)
-	files, err = ex.Pending(context.Background())
-	require.NoError(t, err)
-	require.Len(t, files, 1)
-
-	// Starting point was not found.
-	ex, err = migrate.NewExecutor(drv, dir, rrw, migrate.WithLogger(log), migrate.WithFromVersion("4"))
-	require.NoError(t, err)
-	files, err = ex.Pending(context.Background())
-	require.EqualError(t, err, `starting point version "4" not found in the migration directory`)
-	require.Nil(t, files)
-}
-
 type (
 	mockDriver struct {
 		migrate.Driver
@@ -573,11 +857,11 @@ func (m *mockDriver) InspectRealm(context.Context, *schema.InspectRealmOption) (
 	return &m.realm, nil
 }
 
-func (m *mockDriver) SchemaDiff(_, _ *schema.Schema) ([]schema.Change, error) {
+func (m *mockDriver) SchemaDiff(_, _ *schema.Schema, _ ...schema.DiffOption) ([]schema.Change, error) {
 	return m.changes, nil
 }
 
-func (m *mockDriver) RealmDiff(_, _ *schema.Realm) ([]schema.Change, error) {
+func (m *mockDriver) RealmDiff(_, _ *schema.Realm, _ ...schema.DiffOption) ([]schema.Change, error) {
 	return m.changes, nil
 }
 
@@ -592,7 +876,7 @@ func (m *mockDriver) ApplyChanges(_ context.Context, changes []schema.Change, _ 
 
 func (m *mockDriver) Snapshot(context.Context) (migrate.RestoreFunc, error) {
 	if m.dirty {
-		return nil, migrate.NotCleanError{}
+		return nil, &migrate.NotCleanError{}
 	}
 	realm := m.realm
 	return func(context.Context) error {
@@ -664,6 +948,22 @@ func (rrw *mockRevisionReadWriter) ReadRevisions(context.Context) ([]*migrate.Re
 
 func (rrw *mockRevisionReadWriter) clean() {
 	*rrw = []*migrate.Revision{}
+}
+
+type mockWriteRevisionError struct {
+	mockRevisionReadWriter
+	errinit, errdone error // error on init and done
+}
+
+func (m *mockWriteRevisionError) WriteRevision(ctx context.Context, r *migrate.Revision) error {
+	switch {
+	case r.Applied == 0 && m.errinit != nil:
+		return m.errinit
+	case r.Applied == r.Total && m.errdone != nil:
+		return m.errdone
+	default:
+		return m.mockRevisionReadWriter.WriteRevision(ctx, r)
+	}
 }
 
 type mockLogger []migrate.LogEntry

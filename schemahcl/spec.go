@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
+	"strings"
 
 	"ariga.io/atlas/sql/schema"
 
+	"github.com/hashicorp/hcl/v2"
 	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/gocty"
 )
@@ -23,12 +25,14 @@ type (
 		Type      string
 		Attrs     []*Attr
 		Children  []*Resource
+		rang      *hcl.Range
 	}
 
 	// Attr is an attribute of a Resource.
 	Attr struct {
-		K string
-		V cty.Value
+		K    string
+		V    cty.Value
+		rang *hcl.Range
 	}
 
 	// Ref implements Value and represents a reference to another Resource.
@@ -65,7 +69,7 @@ type (
 
 		// FromSpec is an optional function that can be attached
 		// to the type spec and allows converting the schema spec
-		// type to a schema type (from document to databse).
+		// type to a schema type (from document to database).
 		FromSpec func(*Type) (schema.Type, error)
 
 		// ToSpec is an optional function that can be attached
@@ -90,6 +94,15 @@ type (
 		IsRef bool
 	}
 )
+
+// IsRefTo indicates if the Type is a reference to specific schema type definition.
+func (t *Type) IsRefTo(n string) bool {
+	if !t.IsRef {
+		return false
+	}
+	path, err := (&Ref{V: t.T}).ByType(n)
+	return err == nil && len(path) > 0
+}
 
 // IsRef indicates if the attribute is a reference type.
 func (a *Attr) IsRef() bool {
@@ -128,6 +141,25 @@ func (a *Attr) Int() (int, error) {
 	return int(i), nil
 }
 
+// Float64 returns a float64 from the Value of the Attr. If The value is not a LiteralValue or the value
+// cannot be converted to a float64 an error is returned.
+func (a *Attr) Float64() (f float64, err error) {
+	if err = gocty.FromCtyValue(a.V, &f); err != nil {
+		return 0, err
+	}
+	return f, nil
+}
+
+// BigFloat returns a big.Float from the Value of the Attr. If The value is not a LiteralValue or the value
+// cannot be converted to a big.Float an error is returned.
+func (a *Attr) BigFloat() (*big.Float, error) {
+	var f big.Float
+	if err := gocty.FromCtyValue(a.V, &f); err != nil {
+		return nil, err
+	}
+	return &f, nil
+}
+
 // Int64 returns an int64 from the Value of the Attr. If The value is not a LiteralValue or the value
 // cannot be converted to an integer an error is returned.
 func (a *Attr) Int64() (i int64, err error) {
@@ -138,7 +170,7 @@ func (a *Attr) Int64() (i int64, err error) {
 }
 
 // String returns a string from the Value of the Attr. If The value is not a LiteralValue
-// an error is returned.  String values are expected to be quoted. If the value is not
+// an error is returned. String values are expected to be quoted. If the value is not
 // properly quoted an error is returned.
 func (a *Attr) String() (s string, err error) {
 	if err = gocty.FromCtyValue(a.V, &s); err != nil {
@@ -214,6 +246,133 @@ func (a *Attr) Strings() (vs []string, err error) {
 	return vs, nil
 }
 
+// PathIndex represents an index in a reference path.
+type PathIndex struct {
+	T string   // type
+	V []string // identifiers
+}
+
+// Check if the path index is valid.
+func (p *PathIndex) Check() error {
+	if p.T == "" || len(p.V) == 0 {
+		return fmt.Errorf("schemahcl: missing type or identifier %v", p)
+	}
+	for _, v := range p.V {
+		if v == "" {
+			return fmt.Errorf("schemahcl: empty identifier %v", p)
+		}
+	}
+	return nil
+}
+
+// ByType returns the path index for the given type.
+func (r *Ref) ByType(name string) ([]string, error) {
+	if r == nil {
+		return nil, fmt.Errorf("schemahcl: type %q was not found in nil reference", name)
+	}
+	path, err := r.Path()
+	if err != nil {
+		return nil, err
+	}
+	var vs []string
+	for _, p := range path {
+		switch {
+		case p.T != name:
+		case vs != nil:
+			return nil, fmt.Errorf("schemahcl: multiple %q found in reference", name)
+		default:
+			if err := p.Check(); err != nil {
+				return nil, err
+			}
+			vs = p.V
+		}
+	}
+	if vs == nil {
+		return nil, fmt.Errorf("schemahcl: missing %q in reference", name)
+	}
+	return vs, nil
+}
+
+// Path returns a parsed path including block types and their identifiers.
+func (r *Ref) Path() (path []PathIndex, err error) {
+	for i := 0; i < len(r.V); i++ {
+		var part PathIndex
+		switch idx := strings.IndexAny(r.V[i:], ".["); {
+		case r.V[i] != '$':
+			return nil, fmt.Errorf("schemahcl: missing type in reference %q", r.V[i:])
+		case idx == -1:
+			return nil, fmt.Errorf("schemahcl: missing identifier in reference %q", r.V[i:])
+		default:
+			part.T = r.V[i+1 : i+idx]
+			i += idx
+		}
+	Ident:
+		for i < len(r.V) {
+			switch {
+			// End of identifier before a type.
+			case strings.HasPrefix(r.V[i:], ".$"):
+				break Ident
+			// Scan identifier.
+			case r.V[i] == '.':
+				v := r.V[i+1:]
+				if idx := strings.IndexAny(v, ".["); idx != -1 {
+					v = v[:idx]
+				}
+				part.V = append(part.V, v)
+				i += 1 + len(v)
+			// Scan attribute (["..."]).
+			case strings.HasPrefix(r.V[i:], "[\""):
+				idx := scanString(r.V[i+2:])
+				if idx == -1 {
+					return nil, fmt.Errorf("schemahcl: unterminated string in reference %q", r.V[i:])
+				}
+				v := r.V[i+2 : i+2+idx]
+				i += 2 + idx
+				if !strings.HasPrefix(r.V[i:], "\"]") {
+					return nil, fmt.Errorf("schemahcl: missing ']' in reference %q", r.V[i:])
+				}
+				part.V = append(part.V, v)
+				i += 2
+			default:
+				return nil, fmt.Errorf("schemahcl: invalid character in reference %q", r.V[i:])
+			}
+		}
+		if err := part.Check(); err != nil {
+			return nil, err
+		}
+		path = append(path, part)
+	}
+	return
+}
+
+// BuildRef from a path.
+func BuildRef(path []PathIndex) *Ref {
+	var v string
+	for _, p := range path {
+		switch {
+		case len(p.V) == 1:
+			v = addr(v, p.T, p.V[0], "")
+		case len(p.V) == 2:
+			v = addr(v, p.T, p.V[1], p.V[0])
+		default:
+			v = addr(v, p.T, "", "")
+		}
+	}
+	return &Ref{V: v}
+}
+
+func scanString(s string) int {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case '"':
+			return i
+		}
+	}
+	return -1
+}
+
 // Bools returns a slice of bools from the Value of the Attr. If The value is not a ListValue or its
 // values cannot be converted to bools an error is returned.
 func (a *Attr) Bools() (vs []bool, err error) {
@@ -233,6 +392,28 @@ func (a *Attr) Bools() (vs []bool, err error) {
 	return vs, nil
 }
 
+// SetRange sets the range of this attribute.
+func (a *Attr) SetRange(p *hcl.Range) {
+	a.rang = p
+}
+
+// Range returns the attribute range on the
+// file, or nil if it is not set.
+func (a *Attr) Range() *hcl.Range {
+	return a.rang
+}
+
+// SetRange sets the range of this resource.
+func (r *Resource) SetRange(p *hcl.Range) {
+	r.rang = p
+}
+
+// Range returns the resource range on the
+// file, or nil if it is not set.
+func (r *Resource) Range() *hcl.Range {
+	return r.rang
+}
+
 // Resource returns the first child Resource by its type and reports whether it was found.
 func (r *Resource) Resource(t string) (*Resource, bool) {
 	if r == nil {
@@ -246,18 +427,45 @@ func (r *Resource) Resource(t string) (*Resource, bool) {
 	return nil, false
 }
 
+// Resources returns all child Resources by its type.
+func (r *Resource) Resources(t string) []*Resource {
+	if r == nil {
+		return nil
+	}
+	var rs []*Resource
+	for i := range r.Children {
+		if r.Children[i].Type == t {
+			rs = append(rs, r.Children[i])
+		}
+	}
+	return rs
+}
+
 // Attr returns the Attr by the provided name and reports whether it was found.
 func (r *Resource) Attr(name string) (*Attr, bool) {
-	return attrVal(r.Attrs, name)
+	if at, ok := attrVal(r.Attrs, name); ok {
+		return at, true
+	}
+	for _, r := range r.Children {
+		if at, ok := attrVal(r.Attrs, name); ok && r.Type == "" {
+			return at, true // Match on embedded resource.
+		}
+	}
+	return nil, false
 }
 
 // SetAttr sets the Attr on the Resource. If r is nil, a zero value Resource
 // is initialized. If an Attr with the same key exists, it is replaced by attr.
 func (r *Resource) SetAttr(attr *Attr) {
-	if r == nil {
-		*r = Resource{}
-	}
 	r.Attrs = replaceOrAppendAttr(r.Attrs, attr)
+}
+
+// EmbedAttr is like SetAttr but appends the attribute to an embedded
+// resource, cause it to be marshaled after current blocks and attributes.
+func (r *Resource) EmbedAttr(attr *Attr) {
+	r.Children = append(r.Children, &Resource{
+		Attrs: []*Attr{attr},
+	})
 }
 
 // MarshalSpec implements Marshaler.
@@ -333,6 +541,16 @@ func RefAttr(k string, v *Ref) *Attr {
 	}
 }
 
+// RefValue is a helper method for constructing a cty.Value that contains a Ref value.
+func RefValue(v string) cty.Value {
+	return cty.CapsuleVal(ctyRefType, &Ref{V: v})
+}
+
+// TypeValue is a helper method for constructing a cty.Value that contains a Type value.
+func TypeValue(t *Type) cty.Value {
+	return cty.CapsuleVal(ctyTypeSpec, t)
+}
+
 // StringsAttr is a helper method for constructing *schemahcl.Attr instances that contain list strings.
 func StringsAttr(k string, vs ...string) *Attr {
 	vv := make([]cty.Value, len(vs))
@@ -368,4 +586,42 @@ func RawAttr(k string, x string) *Attr {
 // RawExprValue is a helper method for constructing a cty.Value that capsules a raw expression.
 func RawExprValue(x *RawExpr) cty.Value {
 	return cty.CapsuleVal(ctyRawExpr, x)
+}
+
+// ctyEnumString is a capsule type for EnumString.
+var ctyEnumString = cty.Capsule("enum_string", reflect.TypeOf(EnumString{}))
+
+// EnumString is a helper type that represents
+// either an enum or a string value.
+type EnumString struct {
+	E, S string // Enum or string value.
+}
+
+// StringEnumsAttr is a helper method for constructing *schemahcl.Attr instances
+// that contain list of elements that their values can be either enum or string.
+func StringEnumsAttr(k string, elems ...*EnumString) *Attr {
+	vv := make([]cty.Value, len(elems))
+	for i, e := range elems {
+		vv[i] = cty.CapsuleVal(ctyEnumString, e)
+	}
+	return &Attr{
+		K: k,
+		V: cty.ListVal(vv),
+	}
+}
+
+// RangeAsPos builds a schema position from the give HCL range.
+func RangeAsPos(r *hcl.Range) *schema.Pos {
+	return &schema.Pos{
+		Filename: r.Filename,
+		Start:    r.Start,
+		End:      r.End,
+	}
+}
+
+// AppendPos appends the range to the attributes.
+func AppendPos(attrs *[]schema.Attr, r *hcl.Range) {
+	if r != nil {
+		schema.ReplaceOrAppend(attrs, RangeAsPos(r))
+	}
 }

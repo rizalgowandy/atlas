@@ -8,7 +8,6 @@ import (
 	"context"
 	"testing"
 
-	"ariga.io/atlas/sql/internal/sqlx"
 	"ariga.io/atlas/sql/migrate"
 	"ariga.io/atlas/sql/schema"
 	"ariga.io/atlas/sql/sqlcheck"
@@ -26,7 +25,7 @@ func TestDetectModifyTable(t *testing.T) {
 			Dev: &sqlclient.Client{
 				Driver: func() migrate.Driver {
 					drv := &sqlite.Driver{}
-					drv.Differ = &sqlx.Diff{DiffDriver: &sqlite.Diff{}}
+					drv.Differ = sqlite.DefaultDiff
 					return drv
 				}(),
 			},
@@ -126,7 +125,7 @@ func TestDetectModifyTable(t *testing.T) {
 	)
 	azs, err := sqlcheck.AnalyzerFor(sqlite.DriverName, nil)
 	require.NoError(t, err)
-	require.Len(t, azs, 4)
+	require.Len(t, azs, 6)
 	require.NoError(t, azs[0].Analyze(context.Background(), pass))
 	err = azs[1].Analyze(context.Background(), pass)
 	require.EqualError(t, err, "destructive changes detected")

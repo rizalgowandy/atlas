@@ -13,6 +13,8 @@ import (
 	"ariga.io/atlas/sql/sqlcheck/condrop"
 	"ariga.io/atlas/sql/sqlcheck/datadepend"
 	"ariga.io/atlas/sql/sqlcheck/destructive"
+	"ariga.io/atlas/sql/sqlcheck/incompatible"
+	"ariga.io/atlas/sql/sqlcheck/naming"
 )
 
 func addNotNull(p *datadepend.ColumnPass) (diags []sqlcheck.Diagnostic, err error) {
@@ -31,19 +33,28 @@ func addNotNull(p *datadepend.ColumnPass) (diags []sqlcheck.Diagnostic, err erro
 	}, nil
 }
 
-func init() {
-	sqlcheck.Register(postgres.DriverName, func(r *schemahcl.Resource) ([]sqlcheck.Analyzer, error) {
-		ds, err := destructive.New(r)
-		if err != nil {
-			return nil, err
-		}
-		cd, err := condrop.New(r)
-		if err != nil {
-			return nil, err
-		}
-		dd, err := datadepend.New(r, datadepend.Handler{
-			AddNotNull: addNotNull,
-		})
-		return []sqlcheck.Analyzer{ds, dd, cd}, nil
+func analyzers(r *schemahcl.Resource) ([]sqlcheck.Analyzer, error) {
+	ds, err := destructive.New(r)
+	if err != nil {
+		return nil, err
+	}
+	cd, err := condrop.New(r)
+	if err != nil {
+		return nil, err
+	}
+	dd, err := datadepend.New(r, datadepend.Handler{
+		AddNotNull: addNotNull,
 	})
+	if err != nil {
+		return nil, err
+	}
+	bc, err := incompatible.New(r)
+	if err != nil {
+		return nil, err
+	}
+	nm, err := naming.New(r)
+	if err != nil {
+		return nil, err
+	}
+	return []sqlcheck.Analyzer{ds, dd, cd, bc, nm}, nil
 }

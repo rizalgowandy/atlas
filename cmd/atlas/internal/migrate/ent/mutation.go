@@ -16,8 +16,8 @@ import (
 	"ariga.io/atlas/cmd/atlas/internal/migrate/ent/predicate"
 	"ariga.io/atlas/cmd/atlas/internal/migrate/ent/revision"
 	"ariga.io/atlas/sql/migrate"
-
 	"entgo.io/ent"
+	"entgo.io/ent/dialect/sql"
 )
 
 const (
@@ -35,28 +35,29 @@ const (
 // RevisionMutation represents an operation that mutates the Revision nodes in the graph.
 type RevisionMutation struct {
 	config
-	op                Op
-	typ               string
-	id                *string
-	description       *string
-	_type             *migrate.RevisionType
-	add_type          *migrate.RevisionType
-	applied           *int
-	addapplied        *int
-	total             *int
-	addtotal          *int
-	executed_at       *time.Time
-	execution_time    *time.Duration
-	addexecution_time *time.Duration
-	error             *string
-	error_stmt        *string
-	hash              *string
-	partial_hashes    *[]string
-	operator_version  *string
-	clearedFields     map[string]struct{}
-	done              bool
-	oldValue          func(context.Context) (*Revision, error)
-	predicates        []predicate.Revision
+	op                   Op
+	typ                  string
+	id                   *string
+	description          *string
+	_type                *migrate.RevisionType
+	add_type             *migrate.RevisionType
+	applied              *int
+	addapplied           *int
+	total                *int
+	addtotal             *int
+	executed_at          *time.Time
+	execution_time       *time.Duration
+	addexecution_time    *time.Duration
+	error                *string
+	error_stmt           *string
+	hash                 *string
+	partial_hashes       *[]string
+	appendpartial_hashes []string
+	operator_version     *string
+	clearedFields        map[string]struct{}
+	done                 bool
+	oldValue             func(context.Context) (*Revision, error)
+	predicates           []predicate.Revision
 }
 
 var _ ent.Mutation = (*RevisionMutation)(nil)
@@ -596,6 +597,7 @@ func (m *RevisionMutation) ResetHash() {
 // SetPartialHashes sets the "partial_hashes" field.
 func (m *RevisionMutation) SetPartialHashes(s []string) {
 	m.partial_hashes = &s
+	m.appendpartial_hashes = nil
 }
 
 // PartialHashes returns the value of the "partial_hashes" field in the mutation.
@@ -624,9 +626,23 @@ func (m *RevisionMutation) OldPartialHashes(ctx context.Context) (v []string, er
 	return oldValue.PartialHashes, nil
 }
 
+// AppendPartialHashes adds s to the "partial_hashes" field.
+func (m *RevisionMutation) AppendPartialHashes(s []string) {
+	m.appendpartial_hashes = append(m.appendpartial_hashes, s...)
+}
+
+// AppendedPartialHashes returns the list of values that were appended to the "partial_hashes" field in this mutation.
+func (m *RevisionMutation) AppendedPartialHashes() ([]string, bool) {
+	if len(m.appendpartial_hashes) == 0 {
+		return nil, false
+	}
+	return m.appendpartial_hashes, true
+}
+
 // ClearPartialHashes clears the value of the "partial_hashes" field.
 func (m *RevisionMutation) ClearPartialHashes() {
 	m.partial_hashes = nil
+	m.appendpartial_hashes = nil
 	m.clearedFields[revision.FieldPartialHashes] = struct{}{}
 }
 
@@ -639,6 +655,7 @@ func (m *RevisionMutation) PartialHashesCleared() bool {
 // ResetPartialHashes resets all changes to the "partial_hashes" field.
 func (m *RevisionMutation) ResetPartialHashes() {
 	m.partial_hashes = nil
+	m.appendpartial_hashes = nil
 	delete(m.clearedFields, revision.FieldPartialHashes)
 }
 
@@ -683,9 +700,24 @@ func (m *RevisionMutation) Where(ps ...predicate.Revision) {
 	m.predicates = append(m.predicates, ps...)
 }
 
+// WhereP appends storage-level predicates to the RevisionMutation builder. Using this method,
+// users can use type-assertion to append predicates that do not depend on any generated package.
+func (m *RevisionMutation) WhereP(ps ...func(*sql.Selector)) {
+	p := make([]predicate.Revision, len(ps))
+	for i := range ps {
+		p[i] = ps[i]
+	}
+	m.Where(p...)
+}
+
 // Op returns the operation name.
 func (m *RevisionMutation) Op() Op {
 	return m.op
+}
+
+// SetOp allows setting the mutation operation.
+func (m *RevisionMutation) SetOp(op Op) {
+	m.op = op
 }
 
 // Type returns the node type of this mutation (Revision).

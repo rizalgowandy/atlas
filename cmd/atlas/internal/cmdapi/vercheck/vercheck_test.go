@@ -6,13 +6,19 @@ package vercheck
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
+
+	"ariga.io/atlas/cmd/atlas/internal/cloudapi"
+	"ariga.io/atlas/cmd/atlas/internal/cmdstate"
 
 	"github.com/stretchr/testify/require"
 )
@@ -27,11 +33,15 @@ func TestVerCheck(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	vc := New(srv.URL, "")
-	check, err := vc.Check("v0.1.2")
+	home := cmdstate.TestingHome(t)
+	vc := New(srv.URL)
+	ver := "v0.1.2"
+	check, err := vc.Check(context.Background(), ver)
 
-	require.EqualValues(t, "/atlas/v0.1.2", path)
-	require.EqualValues(t, "Ariga-Atlas-CLI", ua)
+	require.EqualValues(t, "/atlas/"+ver, path)
+	cloudapi.SetVersion(ver, "")
+	expUA := fmt.Sprintf("Atlas/development (%s/%s)", runtime.GOOS, runtime.GOARCH)
+	require.EqualValues(t, expUA, ua)
 	require.NoError(t, err)
 	require.EqualValues(t, &Payload{
 		Latest: &Latest{
@@ -40,6 +50,10 @@ func TestVerCheck(t *testing.T) {
 			Link:    "https://github.com/ariga/atlas/releases/tag/v0.7.2",
 		},
 	}, check)
+
+	dirs, err := os.ReadDir(filepath.Join(home, ".atlas"))
+	require.NoError(t, err)
+	require.Len(t, dirs, 1)
 }
 
 func TestState(t *testing.T) {
@@ -80,28 +94,44 @@ func TestState(t *testing.T) {
 				_, _ = w.Write([]byte(`{}`))
 			}))
 			t.Cleanup(srv.Close)
-			path := filepath.Join(t.TempDir(), "release.json")
+			home := cmdstate.TestingHome(t)
+			path := filepath.Join(home, ".atlas", StateFileName)
 			if tt.state != "" {
-				err := os.WriteFile(path, []byte(tt.state), os.ModePerm)
-				require.NoError(t, err)
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), os.ModePerm))
+				require.NoError(t, os.WriteFile(path, []byte(tt.state), 0666))
 			}
-			vc := New(srv.URL, path)
-			_, _ = vc.Check("v0.1.2")
+			vc := New(srv.URL)
+			_, _ = vc.Check(context.Background(), "v0.1.2")
 			require.EqualValues(t, tt.expectedRun, ran)
 
-			b, err := os.ReadFile(path)
+			buf, err := os.ReadFile(path)
 			require.NoError(t, err)
 			if tt.expectedRun {
-				require.NotEqualValues(t, tt.state, b)
+				require.NotEqualValues(t, tt.state, buf)
 			} else {
-				require.EqualValues(t, tt.state, b)
+				require.EqualValues(t, tt.state, buf)
 			}
 		})
 	}
 }
 
-func TestTemplate(t *testing.T) {
+func TestStatePersist(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+	home := cmdstate.TestingHome(t)
+	path := filepath.Join(home, ".atlas", StateFileName)
+	vc := New(srv.URL)
+	_, err := vc.Check(context.Background(), "v0.1.2")
+	require.NoError(t, err)
 
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(b), `"checkedat":`)
+}
+
+func TestTemplate(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		payload Payload
@@ -122,6 +152,7 @@ func TestTemplate(t *testing.T) {
 				},
 			},
 			exp: `A new version of Atlas is available (v0.7.2): https://atlasgo.io/v0.7.2
+
 A great version including amazing features.`,
 		},
 		{
@@ -132,7 +163,8 @@ A great version including amazing features.`,
 					Link:    "https://atlasgo.io/v0.7.2",
 				},
 			},
-			exp: `A new version of Atlas is available (v0.7.2): https://atlasgo.io/v0.7.2`,
+			exp: `A new version of Atlas is available (v0.7.2): https://atlasgo.io/v0.7.2
+`,
 		},
 		{
 			name: "with advisory",

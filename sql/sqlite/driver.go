@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"hash/adler32"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -26,7 +27,7 @@ type (
 	// Driver represents a SQLite driver for introspecting database schemas,
 	// generating diff between schema elements and apply migrations changes.
 	Driver struct {
-		conn
+		*conn
 		schema.Differ
 		schema.Inspector
 		migrate.PlanApplier
@@ -35,11 +36,18 @@ type (
 	// database connection and its information.
 	conn struct {
 		schema.ExecQuerier
+		url *sqlclient.URL
 		// System variables that are set on `Open`.
-		version    string
-		collations []string
+		version string
 	}
 )
+
+var _ interface {
+	migrate.Snapshoter
+	migrate.StmtScanner
+	migrate.CleanChecker
+	schema.TypeParseFormatter
+} = (*Driver)(nil)
 
 // DriverName holds the name used for registration.
 const DriverName = "sqlite3"
@@ -47,25 +55,69 @@ const DriverName = "sqlite3"
 func init() {
 	sqlclient.Register(
 		DriverName,
+		sqlclient.OpenerFunc(opener),
+		sqlclient.RegisterDriverOpener(Open),
+		sqlclient.RegisterTxOpener(OpenTx),
+		sqlclient.RegisterCodec(codec, codec),
+		sqlclient.RegisterFlavours("sqlite"),
+		sqlclient.RegisterURLParser(urlparse{}),
+	)
+	sqlclient.Register(
+		"libsql",
 		sqlclient.DriverOpener(Open),
 		sqlclient.RegisterTxOpener(OpenTx),
-		sqlclient.RegisterCodec(MarshalHCL, EvalHCL),
-		sqlclient.RegisterFlavours("sqlite"),
+		sqlclient.RegisterCodec(codec, codec),
+		sqlclient.RegisterFlavours("libsql+ws", "libsql+wss", "libsql+file"),
 		sqlclient.RegisterURLParser(sqlclient.URLParserFunc(func(u *url.URL) *sqlclient.URL {
-			uc := &sqlclient.URL{URL: u, DSN: strings.TrimPrefix(u.String(), u.Scheme+"://"), Schema: mainFile}
-			if mode := u.Query().Get("mode"); mode == "memory" {
-				// The "file:" prefix is mandatory for memory modes.
-				uc.DSN = "file:" + uc.DSN
+			dsn := strings.TrimPrefix(u.String(), "libsql+")
+			if strings.HasPrefix(dsn, "file://") {
+				dsn = strings.Replace(dsn, "file://", "file:", 1)
 			}
-			return uc
+			return &sqlclient.URL{URL: u, DSN: dsn, Schema: mainFile}
 		})),
 	)
+}
+
+type urlparse struct{}
+
+// ParseURL implements the sqlclient.URLParser interface.
+func (urlparse) ParseURL(u *url.URL) *sqlclient.URL {
+	uc := &sqlclient.URL{URL: u, DSN: strings.TrimPrefix(u.String(), u.Scheme+"://"), Schema: mainFile}
+	if mode := u.Query().Get("mode"); mode == "memory" {
+		// The "file:" prefix is mandatory for memory modes.
+		uc.DSN = "file:" + uc.DSN
+	}
+	return uc
+}
+
+func opener(_ context.Context, u *url.URL) (*sqlclient.Client, error) {
+	ur := urlparse{}.ParseURL(u)
+	db, err := sql.Open(DriverName, ur.DSN)
+	if err != nil {
+		return nil, err
+	}
+	drv, err := Open(db)
+	if err != nil {
+		if cerr := db.Close(); cerr != nil {
+			err = fmt.Errorf("%w: %v", err, cerr)
+		}
+		return nil, err
+	}
+	if drv, ok := drv.(*Driver); ok {
+		drv.url = ur
+	}
+	return &sqlclient.Client{
+		Name:   DriverName,
+		DB:     db,
+		URL:    ur,
+		Driver: drv,
+	}, nil
 }
 
 // Open opens a new SQLite driver.
 func Open(db schema.ExecQuerier) (migrate.Driver, error) {
 	var (
-		c   = conn{ExecQuerier: db}
+		c   = &conn{ExecQuerier: db}
 		ctx = context.Background()
 	)
 	rows, err := db.QueryContext(ctx, "SELECT sqlite_version()")
@@ -75,15 +127,9 @@ func Open(db schema.ExecQuerier) (migrate.Driver, error) {
 	if err := sqlx.ScanOne(rows, &c.version); err != nil {
 		return nil, fmt.Errorf("sqlite: scan version pragma: %w", err)
 	}
-	if rows, err = db.QueryContext(ctx, "SELECT name FROM pragma_collation_list()"); err != nil {
-		return nil, fmt.Errorf("sqlite: query collation_list pragma: %w", err)
-	}
-	if c.collations, err = sqlx.ScanStrings(rows); err != nil {
-		return nil, fmt.Errorf("sqlite: scanning database collations: %w", err)
-	}
 	return &Driver{
 		conn:        c,
-		Differ:      &sqlx.Diff{DiffDriver: &Diff{}},
+		Differ:      &sqlx.Diff{DiffDriver: &diff{}},
 		Inspector:   &inspect{c},
 		PlanApplier: &planApply{c},
 	}, nil
@@ -96,12 +142,12 @@ func (d *Driver) Snapshot(ctx context.Context) (migrate.RestoreFunc, error) {
 		return nil, err
 	}
 	if !(r == nil || (len(r.Schemas) == 1 && r.Schemas[0].Name == mainFile && len(r.Schemas[0].Tables) == 0)) {
-		return nil, migrate.NotCleanError{Reason: fmt.Sprintf("found table %q", r.Schemas[0].Tables[0].Name)}
+		return nil, &migrate.NotCleanError{State: r, Reason: fmt.Sprintf("found table %q", r.Schemas[0].Tables[0].Name)}
 	}
 	return func(ctx context.Context) error {
 		for _, stmt := range []string{
 			"PRAGMA writable_schema = 1;",
-			"DELETE FROM sqlite_master WHERE type IN ('table', 'index', 'trigger');",
+			"DELETE FROM sqlite_master WHERE type IN ('table', 'view', 'index', 'trigger');",
 			"PRAGMA writable_schema = 0;",
 			"VACUUM;",
 		} {
@@ -121,19 +167,24 @@ func (d *Driver) CheckClean(ctx context.Context, revT *migrate.TableIdent) error
 	}
 	switch n := len(r.Schemas); {
 	case n > 1:
-		return migrate.NotCleanError{Reason: fmt.Sprintf("found multiple schemas: %d", len(r.Schemas))}
+		return &migrate.NotCleanError{State: r, Reason: fmt.Sprintf("found multiple schemas: %d", len(r.Schemas))}
 	case n == 1 && r.Schemas[0].Name != mainFile:
-		return migrate.NotCleanError{Reason: fmt.Sprintf("found schema %q", r.Schemas[0].Name)}
+		return &migrate.NotCleanError{State: r, Reason: fmt.Sprintf("found schema %q", r.Schemas[0].Name)}
 	case n == 1 && len(r.Schemas[0].Tables) > 1:
-		return migrate.NotCleanError{Reason: fmt.Sprintf("found multiple tables: %d", len(r.Schemas[0].Tables))}
+		return &migrate.NotCleanError{State: r, Reason: fmt.Sprintf("found multiple tables: %d", len(r.Schemas[0].Tables))}
 	case n == 1 && len(r.Schemas[0].Tables) == 1 && (revT == nil || r.Schemas[0].Tables[0].Name != revT.Name):
-		return migrate.NotCleanError{Reason: fmt.Sprintf("found table %q", r.Schemas[0].Tables[0].Name)}
+		return &migrate.NotCleanError{State: r, Reason: fmt.Sprintf("found table %q", r.Schemas[0].Tables[0].Name)}
 	}
 	return nil
 }
 
 // Lock implements the schema.Locker interface.
 func (d *Driver) Lock(_ context.Context, name string, timeout time.Duration) (schema.UnlockFunc, error) {
+	// If the URL was set and the database is a file, use its name in the lock file.
+	if d.url != nil && strings.HasPrefix(d.url.DSN, "file:") {
+		p := filepath.Join(d.url.Host, d.url.Path)
+		name = fmt.Sprintf("%s_%s", name, fmt.Sprintf("%x", adler32.Checksum([]byte(p))))
+	}
 	path := filepath.Join(os.TempDir(), name+".lock")
 	c, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -151,6 +202,43 @@ func (d *Driver) Lock(_ context.Context, name string, timeout time.Duration) (sc
 		return nil, fmt.Errorf("sql/sqlite: lock on %q already taken", name)
 	}
 	return acquireLock(path, timeout)
+}
+
+// Version returns the version of the connected database.
+func (d *Driver) Version() string {
+	return d.conn.version
+}
+
+// FormatType converts schema type to its column form in the database.
+func (*Driver) FormatType(t schema.Type) (string, error) {
+	return FormatType(t)
+}
+
+// ParseType returns the schema.Type value represented by the given string.
+func (*Driver) ParseType(s string) (schema.Type, error) {
+	return ParseType(s)
+}
+
+// StmtBuilder is a helper method used to build statements with SQLite formatting.
+func (*Driver) StmtBuilder(opts migrate.PlanOptions) *sqlx.Builder {
+	return &sqlx.Builder{
+		QuoteOpening: '`',
+		QuoteClosing: '`',
+		Schema:       opts.SchemaQualifier,
+		Indent:       opts.Indent,
+	}
+}
+
+// ScanStmts implements migrate.StmtScanner.
+func (*Driver) ScanStmts(input string) ([]*migrate.Stmt, error) {
+	return (&migrate.Scanner{
+		ScannerOptions: migrate.ScannerOptions{
+			MatchBegin: true,
+			// The following are not support by SQLite.
+			MatchBeginAtomic: false,
+			MatchDollarQuote: false,
+		},
+	}).Scan(input)
 }
 
 func acquireLock(path string, timeout time.Duration) (schema.UnlockFunc, error) {

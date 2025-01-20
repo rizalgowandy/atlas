@@ -37,6 +37,21 @@ func FormatType(t schema.Type) (string, error) {
 		f = strings.ToLower(t.T)
 	case *CurrencyType:
 		f = strings.ToLower(t.T)
+	case *CompositeType:
+		if t.T == "" {
+			return "", errors.New("postgres: missing composite type name")
+		}
+		f = t.T
+	case *RowType:
+		if t.T == nil || t.T.Name == "" {
+			return "", errors.New("postgres: missing table for composite (row) type")
+		}
+		f = t.T.Name
+	case *DomainType:
+		if t.T == "" {
+			return "", errors.New("postgres: missing domain type name")
+		}
+		f = t.T
 	case *schema.EnumType:
 		if t.T == "" {
 			return "", errors.New("postgres: missing enum type name")
@@ -44,6 +59,7 @@ func FormatType(t schema.Type) (string, error) {
 		f = t.T
 	case *schema.IntegerType:
 		switch f = strings.ToLower(t.T); f {
+		case TypeXID, TypeXID8:
 		case TypeSmallInt, TypeInteger, TypeBigInt:
 		case TypeInt2:
 			f = TypeSmallInt
@@ -62,7 +78,7 @@ func FormatType(t schema.Type) (string, error) {
 		}
 	case *schema.StringType:
 		switch f = strings.ToLower(t.T); f {
-		case TypeText:
+		case TypeText, TypeBPChar, typeName:
 		// CHAR(n) is alias for CHARACTER(n). If not length was
 		// specified, the definition is equivalent to CHARACTER(1).
 		case TypeChar, TypeCharacter:
@@ -136,19 +152,35 @@ func FormatType(t schema.Type) (string, error) {
 		}
 	case *schema.JSONType:
 		f = strings.ToLower(t.T)
-	case *UUIDType:
+	case *schema.UUIDType:
 		f = strings.ToLower(t.T)
 	case *schema.SpatialType:
 		f = strings.ToLower(t.T)
 	case *NetworkType:
 		f = strings.ToLower(t.T)
+	case *RangeType:
+		switch f = strings.ToLower(t.T); f {
+		case TypeInt4Range, TypeInt4MultiRange, TypeInt8Range, TypeInt8MultiRange, TypeNumRange, TypeNumMultiRange,
+			TypeTSRange, TypeTSMultiRange, TypeTSTZRange, TypeTSTZMultiRange, TypeDateRange, TypeDateMultiRange:
+		default:
+			return "", fmt.Errorf("postgres: unsupported range type: %q", t.T)
+		}
+	case *OIDType:
+		switch f = strings.ToLower(t.T); f {
+		case typeOID, typeRegClass, typeRegCollation, typeRegConfig, typeRegDictionary, typeRegNamespace,
+			typeRegOper, typeRegOperator, typeRegProc, typeRegProcedure, typeRegRole, typeRegType:
+		default:
+			return "", fmt.Errorf("postgres: unsupported object identifier type: %q", t.T)
+		}
 	case *TextSearchType:
 		if f = strings.ToLower(t.T); f != TypeTSVector && f != TypeTSQuery {
 			return "", fmt.Errorf("postgres: unsupported text search type: %q", t.T)
 		}
 	case *UserDefinedType:
-		f = strings.ToLower(t.T)
+		f = t.T
 	case *XMLType:
+		f = strings.ToLower(t.T)
+	case *PseudoType:
 		f = strings.ToLower(t.T)
 	case *schema.UnsupportedType:
 		return "", fmt.Errorf("postgres: unsupported type: %q", t.T)
@@ -188,7 +220,7 @@ func ParseType(typ string) (schema.Type, error) {
 func columnType(c *columnDesc) (schema.Type, error) {
 	var typ schema.Type
 	switch t := c.typ; strings.ToLower(t) {
-	case TypeBigInt, TypeInt8, TypeInt, TypeInteger, TypeInt4, TypeSmallInt, TypeInt2, TypeInt64:
+	case TypeBigInt, TypeInt8, TypeInt, TypeInteger, TypeInt4, TypeSmallInt, TypeInt2, TypeInt64, TypeXID, TypeXID8:
 		typ = &schema.IntegerType{T: t}
 	case TypeBit, TypeBitVar:
 		typ = &BitType{T: t, Len: c.size}
@@ -196,7 +228,10 @@ func columnType(c *columnDesc) (schema.Type, error) {
 		typ = &schema.BoolType{T: t}
 	case TypeBytea:
 		typ = &schema.BinaryType{T: t}
-	case TypeCharacter, TypeChar, TypeCharVar, TypeVarChar, TypeText:
+	case TypeCharacter, TypeChar, TypeCharVar, TypeVarChar, TypeText, TypeBPChar, typeName:
+		if t == TypeCharacter && c.size == 0 && c.fmtype == TypeBPChar {
+			t = TypeBPChar
+		}
 		// A `character` column without length specifier is equivalent to `character(1)`,
 		// but `varchar` without length accepts strings of any size (same as `text`).
 		typ = &schema.StringType{T: t, Size: int(c.size)}
@@ -237,7 +272,7 @@ func columnType(c *columnDesc) (schema.Type, error) {
 	case TypeSmallSerial, TypeSerial, TypeBigSerial, TypeSerial2, TypeSerial4, TypeSerial8:
 		typ = &SerialType{T: t, Precision: int(c.precision)}
 	case TypeUUID:
-		typ = &UUIDType{T: t}
+		typ = &schema.UUIDType{T: t}
 	case TypeXML:
 		typ = &XMLType{T: t}
 	case TypeArray:
@@ -249,30 +284,31 @@ func columnType(c *columnDesc) (schema.Type, error) {
 			if err != nil {
 				return nil, err
 			}
-			if c.elemtyp == "e" {
-				// Override the element type in
-				// case it is an enum.
-				tt = newEnumType(t, c.typelem)
-			}
 			typ.(*ArrayType).Type = tt
 		}
 	case TypeTSVector, TypeTSQuery:
 		typ = &TextSearchType{T: t}
-	case TypeUserDefined:
-		typ = &UserDefinedType{T: c.fmtype}
+	case TypeInt4Range, TypeInt4MultiRange, TypeInt8Range, TypeInt8MultiRange, TypeNumRange, TypeNumMultiRange,
+		TypeTSRange, TypeTSMultiRange, TypeTSTZRange, TypeTSTZMultiRange, TypeDateRange, TypeDateMultiRange:
+		typ = &RangeType{T: t}
+	case typeOID, typeRegClass, typeRegCollation, typeRegConfig, typeRegDictionary, typeRegNamespace,
+		typeRegOper, typeRegOperator, typeRegProc, typeRegProcedure, typeRegRole, typeRegType:
+		typ = &OIDType{T: t}
+	case typeAny, typeAnyElement, typeAnyArray, typeAnyNonArray, typeAnyEnum, typeInternal,
+		typeRecord, typeTrigger, typeEventTrigger, typeVoid, typeUnknown:
+		typ = &PseudoType{T: t}
+	// TypeUserDefined or any other base type.
 	default:
-		typ = &schema.UnsupportedType{T: t}
+		ft := c.fmtype
+		if ft == "" {
+			ft = t
+		}
+		typ = &UserDefinedType{T: ft, C: c.typtype}
 	}
 	switch c.typtype {
-	case "e":
-		// The `typtype` column is set to 'e' for enum types, and the
-		// values are filled in batch after the rows above is closed.
-		// https://postgresql.org/docs/current/catalog-pg-type.html
-		typ = newEnumType(c.fmtype, c.typid)
-	case "d":
-		// Use user-defined for domain types as we do not
-		// support their creation at this stage.
-		typ = &UserDefinedType{T: c.fmtype}
+	case "d", "e":
+		// User-defined types supported by Atlas.
+		typ = &UserDefinedType{T: c.fmtype, C: c.typtype}
 	}
 	return typ, nil
 }
@@ -310,7 +346,6 @@ type columnDesc struct {
 	size          int64  // character_maximum_length
 	typtype       string // pg_type.typtype
 	typelem       int64  // pg_type.typelem
-	elemtyp       string // pg_type.typtype of the array element type above.
 	typid         int64  // pg_type.oid
 	precision     int64
 	timePrecision *int64
@@ -322,6 +357,9 @@ type columnDesc struct {
 var reDigits = regexp.MustCompile(`\d`)
 
 func parseColumn(s string) (*columnDesc, error) {
+	if s == "" {
+		return nil, errors.New("postgres: unexpected empty column type")
+	}
 	parts := strings.FieldsFunc(s, func(r rune) bool {
 		return r == '(' || r == ')' || r == ' ' || r == ','
 	})

@@ -35,8 +35,8 @@ type (
 		Name() string
 	}
 
-	// A Pass provides information to the Run function that
-	// applies a specific analyzer to an SQL file.
+	// A Pass provides information to the Analyzer.Analyze function
+	// that applies a specific analyzer to an SQL file.
 	Pass struct {
 		// A migration file and the changes it describes.
 		File *File
@@ -60,6 +60,10 @@ type (
 		// statement is reverted by the one after it, the Sum is nil.
 		Sum schema.Changes
 
+		// From, To holds the representation of schema
+		// before and after the file was executed.
+		From, To *schema.Realm
+
 		// A Parser that may be used for parsing this file. It sets to any as the contract
 		// between checks and their parsers can vary. For example, in case of running checks
 		// from CLI, the injected parser can be found in cmd/atlas/internal/sqlparse.Parser.
@@ -77,15 +81,34 @@ type (
 
 	// A Report describes an analysis report with an optional specific diagnostic.
 	Report struct {
-		Text        string       // Report text.
-		Diagnostics []Diagnostic // Report diagnostics.
+		Text           string         `json:"Text"`                     // Report text.
+		Desc           string         `json:"Desc,omitempty"`           // Optional description (secondary text).
+		Diagnostics    []Diagnostic   `json:"Diagnostics,omitempty"`    // Report diagnostics.
+		SuggestedFixes []SuggestedFix `json:"SuggestedFixes,omitempty"` // Report-level suggested fixes.
 	}
 
 	// A Diagnostic is a text associated with a specific position of a statement in a file.
 	Diagnostic struct {
-		Pos  int    // Diagnostic position.
-		Text string // Diagnostic text.
-		Code string // Code describes the check. For example, DS101
+		Pos            int            `json:"Pos"`                      // Diagnostic position.
+		Text           string         `json:"Text"`                     // Diagnostic text.
+		Code           string         `json:"Code"`                     // Code describes the check. For example, DS101
+		SuggestedFixes []SuggestedFix `json:"SuggestedFixes,omitempty"` // Fixes to this specific diagnostics (statement-level).
+	}
+
+	// A SuggestedFix is a change associated with a diagnostic that can
+	// be applied to fix the issue. Both the message and the text edit
+	// are optional.
+	SuggestedFix struct {
+		Message  string    `json:"Message"`
+		TextEdit *TextEdit `json:"TextEdit,omitempty"`
+	}
+
+	// A TextEdit represents a code changes in a file.
+	// The suggested edits are line-based starting from 1.
+	TextEdit struct {
+		Line    int    `json:"Line"`    // Start line to edit.
+		End     int    `json:"End"`     // End line to edit.
+		NewText string `json:"NewText"` // New text to replace.
 	}
 
 	// ReportWriter represents a writer for analysis reports.
@@ -103,6 +126,11 @@ type (
 		schemahcl.DefaultExtension
 	}
 )
+
+// SuggestFix appends a suggested fix to the diagnostic.
+func (d *Diagnostic) SuggestFix(m string, e *TextEdit) {
+	d.SuggestedFixes = append(d.SuggestedFixes, SuggestedFix{Message: m, TextEdit: e})
+}
 
 // Analyzers implements Analyzer.
 type Analyzers []Analyzer
@@ -170,9 +198,14 @@ func (f *File) ColumnSpan(t *schema.Table, c *schema.Column) ResourceSpan {
 	return f.tableSpan(t).columns[c.Name]
 }
 
-// IndexSpan returns the span information for the span.
+// IndexSpan returns the span information for the index.
 func (f *File) IndexSpan(t *schema.Table, i *schema.Index) ResourceSpan {
 	return f.tableSpan(t).indexes[i.Name]
+}
+
+// ForeignKeySpan returns the span information for the foreign-key constraint.
+func (f *File) ForeignKeySpan(t *schema.Table, fk *schema.ForeignKey) ResourceSpan {
+	return f.tableSpan(t).forkeys[fk.Symbol]
 }
 
 type (
@@ -186,6 +219,7 @@ type (
 		state   ResourceSpan
 		columns map[string]ResourceSpan
 		indexes map[string]ResourceSpan
+		forkeys map[string]ResourceSpan
 	}
 )
 
@@ -207,6 +241,9 @@ func (f *File) loadSpans() {
 				for _, idx := range c.T.Indexes {
 					span.indexes[idx.Name] = SpanAdded
 				}
+				for _, fk := range c.T.ForeignKeys {
+					span.forkeys[fk.Symbol] = SpanAdded
+				}
 			case *schema.DropTable:
 				f.tableSpan(c.T).state |= SpanDropped
 			case *schema.ModifyTable:
@@ -221,6 +258,10 @@ func (f *File) loadSpans() {
 						span.indexes[c1.I.Name] = SpanAdded
 					case *schema.DropIndex:
 						span.indexes[c1.I.Name] |= SpanDropped
+					case *schema.AddForeignKey:
+						span.forkeys[c1.F.Symbol] = SpanAdded
+					case *schema.DropForeignKey:
+						span.forkeys[c1.F.Symbol] |= SpanDropped
 					}
 				}
 			}
@@ -244,6 +285,7 @@ func (f *File) tableSpan(t *schema.Table) *tableSpan {
 		span.tables[t.Name] = &tableSpan{
 			columns: make(map[string]ResourceSpan),
 			indexes: make(map[string]ResourceSpan),
+			forkeys: make(map[string]ResourceSpan),
 		}
 	}
 	return f.spans[t.Schema.Name].tables[t.Name]

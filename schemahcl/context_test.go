@@ -6,6 +6,7 @@ package schemahcl
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -317,32 +318,37 @@ func TestSchemaRefParse(t *testing.T) {
 		Points []*Point `spec:"point"`
 	}{
 		Points: []*Point{
-			{Z: []*Ref{{V: "$a"}}},
-			{Z: []*Ref{{V: "b"}}},
+			{Z: []*Ref{{V: "$point.1"}}},
+			{Z: []*Ref{{V: "$point.0"}}},
 		},
 	}
 	b, err := Marshal(&test)
 	require.NoError(t, err)
 	expected :=
 		`point {
-  z = [a]
+  z = [point.1]
 }
 point {
-  z = [b]
+  z = [point.0]
 }
 `
 	require.Equal(t, expected, string(b))
 }
 
 func TestWithTypes(t *testing.T) {
-	f := `first    = int
-second   = bool
-third    = int(10)
-sized    = varchar(255)
-variadic = enum("a","b","c")
+	f := `parent "name" {
+  child "name" {
+    first    = int
+    second   = bool
+    third    = int(10)
+    sized    = varchar(255)
+    variadic = enum("a","b","c")
+  }
+}
 `
 	s := New(
 		WithTypes(
+			"parent.child",
 			[]*TypeSpec{
 				{Name: "bool", T: "bool"},
 				{
@@ -371,32 +377,38 @@ variadic = enum("a","b","c")
 		),
 	)
 	var test struct {
-		First    *Type `spec:"first"`
-		Second   *Type `spec:"second"`
-		Third    *Type `spec:"third"`
-		Varchar  *Type `spec:"sized"`
-		Variadic *Type `spec:"variadic"`
+		Parent struct {
+			Name  string `spec:",name"`
+			Child struct {
+				Name     string `spec:",name"`
+				First    *Type  `spec:"first"`
+				Second   *Type  `spec:"second"`
+				Third    *Type  `spec:"third"`
+				Varchar  *Type  `spec:"sized"`
+				Variadic *Type  `spec:"variadic"`
+			} `spec:"child"`
+		} `spec:"parent"`
 	}
 	err := s.EvalBytes([]byte(f), &test, nil)
 	require.NoError(t, err)
-	require.EqualValues(t, "int", test.First.T)
-	require.EqualValues(t, "bool", test.Second.T)
+	require.EqualValues(t, "int", test.Parent.Child.First.T)
+	require.EqualValues(t, "bool", test.Parent.Child.Second.T)
 
-	require.EqualValues(t, "varchar", test.Varchar.T)
-	require.Len(t, test.Varchar.Attrs, 1)
-	i, err := test.Varchar.Attrs[0].Int()
+	require.EqualValues(t, "varchar", test.Parent.Child.Varchar.T)
+	require.Len(t, test.Parent.Child.Varchar.Attrs, 1)
+	i, err := test.Parent.Child.Varchar.Attrs[0].Int()
 	require.NoError(t, err)
 	require.EqualValues(t, 255, i)
 
-	require.EqualValues(t, "enum", test.Variadic.T)
-	require.Len(t, test.Variadic.Attrs, 1)
-	vs, err := test.Variadic.Attrs[0].Strings()
+	require.EqualValues(t, "enum", test.Parent.Child.Variadic.T)
+	require.Len(t, test.Parent.Child.Variadic.Attrs, 1)
+	vs, err := test.Parent.Child.Variadic.Attrs[0].Strings()
 	require.NoError(t, err)
 	require.EqualValues(t, []string{"a", "b", "c"}, vs)
 
-	require.EqualValues(t, "int", test.Third.T)
-	require.Len(t, test.Third.Attrs, 1)
-	i, err = test.Third.Attrs[0].Int()
+	require.EqualValues(t, "int", test.Parent.Child.Third.T)
+	require.Len(t, test.Parent.Child.Third.Attrs, 1)
+	i, err = test.Parent.Child.Third.Attrs[0].Int()
 	require.NoError(t, err)
 	require.EqualValues(t, 10, i)
 
@@ -406,7 +418,7 @@ variadic = enum("a","b","c")
 }
 
 func TestEmptyStrSQL(t *testing.T) {
-	s := New(WithTypes(nil))
+	s := New(WithTypes("", nil))
 	h := `x = sql("")`
 	err := s.EvalBytes([]byte(h), &struct{}{}, nil)
 	require.ErrorContains(t, err, "empty expression")
@@ -414,43 +426,49 @@ func TestEmptyStrSQL(t *testing.T) {
 
 func TestOptionalArgs(t *testing.T) {
 	s := New(
-		WithTypes([]*TypeSpec{
+		WithTypes("block", []*TypeSpec{
 			{
 				T:    "float",
 				Name: "float",
 				Attributes: []*TypeAttr{
-					{Name: "precision", Kind: reflect.Int, Required: false},
-					{Name: "scale", Kind: reflect.Int, Required: false},
+					PrecisionTypeAttr(),
+					ScaleTypeAttr(),
 				},
 			},
 		}),
 	)
-	f := `arg_0 = float
-arg_1 = float(10)
-arg_2 = float(10,2)
+	f := `
+block "name" {
+  arg_0 = float
+  arg_1 = float(10)
+  arg_2 = float(10,2)
+}
 `
 	var test struct {
-		Arg0 *Type `spec:"arg_0"`
-		Arg1 *Type `spec:"arg_1"`
-		Arg2 *Type `spec:"arg_2"`
+		Block struct {
+			Name string `spec:",name"`
+			Arg0 *Type  `spec:"arg_0"`
+			Arg1 *Type  `spec:"arg_1"`
+			Arg2 *Type  `spec:"arg_2"`
+		} `spec:"block"`
 	}
 	err := s.EvalBytes([]byte(f), &test, nil)
 	require.NoError(t, err)
-	require.Nil(t, test.Arg0.Attrs)
+	require.Nil(t, test.Block.Arg0.Attrs)
 
-	require.Len(t, test.Arg1.Attrs, 1)
-	require.Equal(t, "precision", test.Arg1.Attrs[0].K)
-	i, err := test.Arg1.Attrs[0].Int()
+	require.Len(t, test.Block.Arg1.Attrs, 1)
+	require.Equal(t, "precision", test.Block.Arg1.Attrs[0].K)
+	i, err := test.Block.Arg1.Attrs[0].Int()
 	require.NoError(t, err)
 	require.EqualValues(t, 10, i)
 
-	require.Len(t, test.Arg2.Attrs, 2)
-	require.Equal(t, "precision", test.Arg2.Attrs[0].K)
-	i, err = test.Arg2.Attrs[0].Int()
+	require.Len(t, test.Block.Arg2.Attrs, 2)
+	require.Equal(t, "precision", test.Block.Arg2.Attrs[0].K)
+	i, err = test.Block.Arg2.Attrs[0].Int()
 	require.NoError(t, err)
 	require.EqualValues(t, 10, i)
-	require.Equal(t, "scale", test.Arg2.Attrs[1].K)
-	i, err = test.Arg2.Attrs[1].Int()
+	require.Equal(t, "scale", test.Block.Arg2.Attrs[1].K)
+	i, err = test.Block.Arg2.Attrs[1].Int()
 	require.NoError(t, err)
 	require.EqualValues(t, 2, i)
 }
@@ -470,6 +488,44 @@ r = user.atlas.cli
 	require.NoError(t, err)
 	require.EqualValues(t, "v0.3.9", test.V)
 	require.EqualValues(t, "$user.atlas.cli", test.R.V)
+}
+
+func TestQuotedRefs(t *testing.T) {
+	h := `
+user "ariel.mashraki" {
+  username = "a8m"
+}
+account "ariga.cloud" "a8m.dev" {
+  org = "dev"
+}
+env "dev" "a8m.dev" {}
+env "prod.1" "a8m" {}
+
+v = user["ariel.mashraki"].username
+r = user["ariel.mashraki"]
+vs = [account["ariga.cloud"]["a8m.dev"].org]
+rs = [
+	account["ariga.cloud"]["a8m.dev"],
+	env["dev"]["a8m.dev"],
+	env["prod.1"]["a8m"],
+]
+`
+	var test struct {
+		V  string   `spec:"v"`
+		R  *Ref     `spec:"r"`
+		Vs []string `spec:"vs"`
+		Rs []*Ref   `spec:"rs"`
+	}
+	err := New().EvalBytes([]byte(h), &test, nil)
+	require.NoError(t, err)
+	require.EqualValues(t, "a8m", test.V)
+	require.EqualValues(t, `$user["ariel.mashraki"]`, test.R.V)
+	require.EqualValues(t, []string{"dev"}, test.Vs)
+	require.EqualValues(t, []*Ref{
+		{`$account["ariga.cloud"]["a8m.dev"]`},
+		{`$env.dev["a8m.dev"]`},
+		{`$env["prod.1"].a8m`},
+	}, test.Rs)
 }
 
 func TestInputValues(t *testing.T) {
@@ -502,6 +558,7 @@ variable "convert_bool" {
 variable "strings" {
   type = list(string)
   default = ["a", "b"]
+  description = "description is a valid attribute"
 }
 
 name = var.name
@@ -512,7 +569,6 @@ convert_int = var.convert_int
 convert_bool = var.convert_bool
 strings = var.strings
 `
-	state := New()
 	var test struct {
 		Name        string   `spec:"name"`
 		Default     string   `spec:"default"`
@@ -522,7 +578,7 @@ strings = var.strings
 		ConvertBool bool     `spec:"convert_bool"`
 		Strings     []string `spec:"strings"`
 	}
-	err := state.EvalBytes([]byte(h), &test, map[string]cty.Value{
+	err := New().EvalBytes([]byte(h), &test, map[string]cty.Value{
 		"name":         cty.StringVal("rotemtam"),
 		"int":          cty.NumberIntVal(42),
 		"bool":         cty.BoolVal(true),
@@ -538,4 +594,54 @@ strings = var.strings
 	require.EqualValues(t, 1, test.ConvertInt)
 	require.EqualValues(t, true, test.ConvertBool)
 	require.EqualValues(t, []string{"a", "b"}, test.Strings)
+}
+
+func TestVariable_InvalidType(t *testing.T) {
+	h := `
+variable "name" {
+  type = "int"
+  default = "boring"
+}`
+	err := New().EvalBytes([]byte(h), &struct{}{}, nil)
+	require.EqualError(t, err, `invalid type "int" for variable "name". Valid types are: string, number, bool, list, map, or set`)
+
+	h = `
+variable "name" {
+  type = "boring"
+  default = "boring"
+}`
+	err = New().EvalBytes([]byte(h), &struct{}{}, nil)
+	require.EqualError(t, err, `invalid type "boring" for variable "name". Valid types are: string, number, bool, list, map, or set`)
+}
+
+func TestTemplateReferences(t *testing.T) {
+	var (
+		d struct {
+			Stmt1 string `spec:"stmt1"`
+			Stmt2 string `spec:"stmt2"`
+		}
+		b = []byte(`
+table "foo" {}
+
+table "bar" {
+  name = "baz"
+  column "id" {
+    type = int
+  }
+}
+
+stmt1 = <<-SQL
+   SELECT * FROM ${table.foo.name}
+  SQL
+stmt2 = <<-SQL
+   SELECT ${table.bar.column.id.name} FROM ${table.bar.name}
+  SQL
+`)
+	)
+	require.NoError(t, New().EvalBytes(b, &d, nil))
+	require.Equal(t, "SELECT * FROM foo", strings.TrimSpace(d.Stmt1))
+	require.Equal(t, "SELECT id FROM baz", strings.TrimSpace(d.Stmt2))
+
+	err := New().EvalBytes([]byte(`v = "${unknown}"`), &d, nil)
+	require.EqualError(t, err, `:1,8-15: Unknown variable; There is no variable named "unknown".`)
 }

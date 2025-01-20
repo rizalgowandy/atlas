@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"ariga.io/atlas/sql/migrate"
@@ -21,6 +22,7 @@ var plan = &migrate.Plan{
 	Changes: []*migrate.Change{
 		{Cmd: "CREATE TABLE t1(c int)", Reverse: "DROP TABLE t1 IF EXISTS", Comment: "create table t1"},
 		{Cmd: "CREATE TABLE t2(c int)", Reverse: "DROP TABLE t2", Comment: "create table t2"},
+		{Cmd: "DROP TABLE t3", Reverse: []string{"CREATE TABLE t1(id int)", "CREATE INDEX idx ON t1(id)"}, Comment: "drop table t3"},
 	},
 }
 
@@ -39,8 +41,13 @@ func TestFormatters(t *testing.T) {
 CREATE TABLE t1(c int);
 -- create table t2
 CREATE TABLE t2(c int);
+-- drop table t3
+DROP TABLE t3;
 `,
-				v + "_tooling-plan.down.sql": `-- reverse: create table t2
+				v + "_tooling-plan.down.sql": `-- reverse: drop table t3
+CREATE TABLE t1(id int);
+CREATE INDEX idx ON t1(id);
+-- reverse: create table t2
 DROP TABLE t2;
 -- reverse: create table t1
 DROP TABLE t1 IF EXISTS;
@@ -56,8 +63,13 @@ DROP TABLE t1 IF EXISTS;
 CREATE TABLE t1(c int);
 -- create table t2
 CREATE TABLE t2(c int);
+-- drop table t3
+DROP TABLE t3;
 
 -- +goose Down
+-- reverse: drop table t3
+CREATE TABLE t1(id int);
+CREATE INDEX idx ON t1(id);
 -- reverse: create table t2
 DROP TABLE t2;
 -- reverse: create table t1
@@ -73,8 +85,13 @@ DROP TABLE t1 IF EXISTS;
 CREATE TABLE t1(c int);
 -- create table t2
 CREATE TABLE t2(c int);
+-- drop table t3
+DROP TABLE t3;
 `,
-				"U" + v + "__tooling-plan.sql": `-- reverse: create table t2
+				"U" + v + "__tooling-plan.sql": `-- reverse: drop table t3
+CREATE TABLE t1(id int);
+CREATE INDEX idx ON t1(id);
+-- reverse: create table t2
 DROP TABLE t2;
 -- reverse: create table t1
 DROP TABLE t1 IF EXISTS;
@@ -86,16 +103,22 @@ DROP TABLE t1 IF EXISTS;
 			sqltool.LiquibaseFormatter,
 			map[string]string{
 				v + "_tooling-plan.sql": fmt.Sprintf(`--liquibase formatted sql
---changeset atlas:%s-1
+--changeset atlas:%[1]s-1
 --comment: create table t1
 CREATE TABLE t1(c int);
 --rollback: DROP TABLE t1 IF EXISTS;
 
---changeset atlas:%s-2
+--changeset atlas:%[1]s-2
 --comment: create table t2
 CREATE TABLE t2(c int);
 --rollback: DROP TABLE t2;
-`, v, v),
+
+--changeset atlas:%[1]s-3
+--comment: drop table t3
+DROP TABLE t3;
+--rollback: CREATE TABLE t1(id int);
+--rollback: CREATE INDEX idx ON t1(id);
+`, v),
 			},
 		},
 		{
@@ -107,8 +130,13 @@ CREATE TABLE t2(c int);
 CREATE TABLE t1(c int);
 -- create table t2
 CREATE TABLE t2(c int);
+-- drop table t3
+DROP TABLE t3;
 
 -- migrate:down
+-- reverse: drop table t3
+CREATE TABLE t1(id int);
+CREATE INDEX idx ON t1(id);
 -- reverse: create table t2
 DROP TABLE t2;
 -- reverse: create table t1
@@ -179,14 +207,15 @@ func TestScanners(t *testing.T) {
 				require.NoError(t, err)
 				return d
 			}(),
-			versions:     []string{"2", "3", ""},
-			descriptions: []string{"baseline", "third_migration", "views"},
+			versions:     []string{"2", "3", "3_1", ""},
+			descriptions: []string{"baseline", "third_migration", "fourth_migration", "views"},
 			stmts: [][]string{
 				{
 					"CREATE TABLE post\n(\n    id    int NOT NULL,\n    title text,\n    body  text,\n    created_at TIMESTAMP NOT NULL\n    PRIMARY KEY (id)\n);",
 					"INSERT INTO post (title, created_at) VALUES (\n'This is\nmy multiline\n\nvalue', NOW());",
 				},
 				{"ALTER TABLE tbl_2 ADD col_1 INTEGER NOT NULL;"},
+				{"ALTER TABLE tbl_2 ADD col_2 INTEGER NOT NULL;"},
 				{"CREATE VIEW `my_view` AS SELECT * FROM `post`;"},
 			},
 		},
@@ -266,6 +295,22 @@ func TestChecksum(t *testing.T) {
 			},
 		},
 		{
+			name: "golang-migrate non-local directory",
+			dir: func() migrate.Dir {
+				fs := fstest.MapFS{
+					"1_initial.down.sql":          &fstest.MapFile{Data: []byte("1_initial.down")},
+					"1_initial.up.sql":            &fstest.MapFile{Data: []byte("1_initial.up")},
+					"2_second_migration.down.sql": &fstest.MapFile{Data: []byte("2_second_migration.down")},
+					"2_second_migration.up.sql":   &fstest.MapFile{Data: []byte("2_second_migration.up")},
+				}
+				return &sqltool.GolangMigrateDir{&fs}
+			}(),
+			files: []string{
+				"1_initial.up.sql",
+				"2_second_migration.up.sql",
+			},
+		},
+		{
 			name: "goose",
 			dir: func() migrate.Dir {
 				d, err := sqltool.NewGooseDir("testdata/goose")
@@ -291,6 +336,53 @@ func TestChecksum(t *testing.T) {
 				"V1__initial.sql",
 				"V2__second_migration.sql",
 				"V3__third_migration.sql",
+			},
+		},
+		{
+			name: "flyway non-local directory",
+			dir: func() migrate.Dir {
+				fs := fstest.MapFS{
+					"U1__initial.sql":               &fstest.MapFile{Data: []byte("U1__initial")},
+					"V1__initial.sql":               &fstest.MapFile{Data: []byte("V1__initial")},
+					"R__views.sql":                  &fstest.MapFile{Data: []byte("R__views")},
+					"B2__baseline.sql":              &fstest.MapFile{Data: []byte("B2__baseline")},
+					"V2__second_migration.sql":      &fstest.MapFile{Data: []byte("V2__second_migration")},
+					"V3__third_migration.sql":       &fstest.MapFile{Data: []byte("V3__third_migration")},
+					"v3/V3_1__fourth_migration.sql": &fstest.MapFile{Data: []byte("V3__1_fourth_migration")},
+				}
+				return &sqltool.FlywayDir{&fs}
+			}(),
+			files: []string{
+				"B2__baseline.sql",
+				"V3__third_migration.sql",
+				"v3/V3_1__fourth_migration.sql",
+				"R__views.sql",
+			},
+		},
+		{
+			name: "flyway with semver versioning",
+			dir: func() migrate.Dir {
+				fs := fstest.MapFS{
+					"V1__.sql":        &fstest.MapFile{Data: []byte("V1")},
+					"V1_1_0__.sql":    &fstest.MapFile{Data: []byte("V1.1.0")},
+					"V1.1.1__.sql":    &fstest.MapFile{Data: []byte("V1.1.1")},
+					"V2__.sql":        &fstest.MapFile{Data: []byte("V2")},
+					"V2.1.0__.sql":    &fstest.MapFile{Data: []byte("V2.1.0")},
+					"V3__.sql":        &fstest.MapFile{Data: []byte("V3")},
+					"V11__.sql":       &fstest.MapFile{Data: []byte("V11")},
+					"V11.11.11__.sql": &fstest.MapFile{Data: []byte("V11.11.11")},
+				}
+				return &sqltool.FlywayDir{&fs}
+			}(),
+			files: []string{
+				"V1__.sql",
+				"V1_1_0__.sql",
+				"V1.1.1__.sql",
+				"V2__.sql",
+				"V2.1.0__.sql",
+				"V3__.sql",
+				"V11__.sql",
+				"V11.11.11__.sql",
 			},
 		},
 		{

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hashicorp/hcl/v2"
 	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/gocty"
 )
@@ -96,10 +97,12 @@ func (r *Resource) As(target any) error {
 	return r.as(target)
 }
 
+var typeRange = reflect.TypeOf(&hcl.Range{})
+
 // As reads the attributes and children resources of the resource into the target struct.
 func (r *Resource) as(target any) error {
 	existingAttrs, existingChildren := existingElements(r)
-	var seenName, seenQualifier bool
+	var seenName, seenQualifier, setRange bool
 	v := reflect.ValueOf(target).Elem()
 	for _, ft := range specFields(target) {
 		field := v.FieldByName(ft.Name)
@@ -119,6 +122,14 @@ func (r *Resource) as(target any) error {
 			}
 			seenQualifier = true
 			field.SetString(r.Qualifier)
+		case ft.isRange() && !hasAttr(r, ft.tag):
+			if field.Type() != typeRange {
+				return fmt.Errorf("schemahcl: expected field %q to be of type *hcl.Range: %v", ft.Name, field.Type())
+			}
+			if r.rang != nil {
+				setRange = true
+				field.Set(reflect.ValueOf(r.rang))
+			}
 		case hasAttr(r, ft.tag):
 			attr, _ := r.Attr(ft.tag)
 			if err := setField(field, attr); err != nil {
@@ -221,6 +232,11 @@ func (r *Resource) as(target any) error {
 		children := childrenOfType(r, childType)
 		extras.Children = append(extras.Children, children...)
 	}
+	// In case the resource contains a remain (DefaultExtension) and
+	// the range was not explicitly set, attach to it the position.
+	if r.rang != nil && rem.Remain() != nil && !setRange {
+		rem.Remain().SetRange(r.rang)
+	}
 	return nil
 }
 
@@ -298,44 +314,53 @@ func setField(field reflect.Value, attr *Attr) error {
 	case reflect.String:
 		s, err := attr.String()
 		if err != nil {
-			return fmt.Errorf("schemahcl: value of attr %q cannot be read as string: %w", attr.K, err)
+			return fmt.Errorf("value of attr %q cannot be read as string: %w", attr.K, err)
 		}
 		field.SetString(s)
 	case reflect.Int, reflect.Int64:
 		i, err := attr.Int()
 		if err != nil {
-			return fmt.Errorf("schemahcl: value of attr %q cannot be read as integer: %w", attr.K, err)
+			return fmt.Errorf("value of attr %q cannot be read as integer: %w", attr.K, err)
 		}
 		field.SetInt(int64(i))
 	case reflect.Bool:
 		b, err := attr.Bool()
 		if err != nil {
-			return fmt.Errorf("schemahcl: value of attr %q cannot be read as bool: %w", attr.K, err)
+			return fmt.Errorf("value of attr %q cannot be read as bool: %w", attr.K, err)
 		}
 		field.SetBool(b)
 	case reflect.Ptr:
 		if err := setPtr(field, attr.V); err != nil {
-			return fmt.Errorf("schemahcl: failed setting pointer field %q: %w", attr.K, err)
+			return fmt.Errorf("set field %q: %w", attr.K, err)
 		}
 	case reflect.Interface:
 		field.Set(reflect.ValueOf(attr.V))
+	case reflect.Map:
+		if attr.V.CanIterateElements() {
+			field.Set(reflect.ValueOf(attr.V.AsValueMap()))
+			return nil
+		}
+		fallthrough
 	default:
 		if err := gocty.FromCtyValue(attr.V, field.Addr().Interface()); err != nil {
-			return fmt.Errorf("schemahcl: failed setting field %q of type %T: %w", attr.K, field, err)
+			return fmt.Errorf("set field %q of type %T: %w", attr.K, field, err)
 		}
 	}
 	return nil
 }
 
-func setPtr(field reflect.Value, val cty.Value) error {
-	rt := reflect.TypeOf(val)
+func setPtr(field reflect.Value, cv cty.Value) error {
+	rt := reflect.TypeOf(cv)
 	if field.Type() == rt {
-		field.Set(reflect.ValueOf(val))
+		field.Set(reflect.ValueOf(cv))
 		return nil
 	}
 	// If we are setting a Type field handle RawExpr and Ref specifically.
 	if _, ok := field.Interface().(*Type); ok {
-		switch t := val.EncapsulatedValue().(type) {
+		if !cv.Type().IsCapsuleType() {
+			return fmt.Errorf("unexpected type %s", cv.Type().FriendlyName())
+		}
+		switch t := cv.EncapsulatedValue().(type) {
 		case *RawExpr:
 			field.Set(reflect.ValueOf(&Type{T: t.X}))
 			return nil
@@ -353,17 +378,17 @@ func setPtr(field reflect.Value, val cty.Value) error {
 	switch e := field.Interface().(type) {
 	case *Ref:
 		switch {
-		case val.Type() == cty.String:
-			e.V = val.AsString()
-		case val.Type().IsCapsuleType():
-			ref, ok := val.EncapsulatedValue().(*Ref)
+		case cv.Type() == cty.String:
+			e.V = cv.AsString()
+		case cv.Type().IsCapsuleType():
+			ref, ok := cv.EncapsulatedValue().(*Ref)
 			if !ok {
-				return fmt.Errorf("schemahcl: expected value to be a *Ref, got: %T", val.EncapsulatedValue())
+				return fmt.Errorf("schemahcl: expected value to be a *Ref, got: %T", cv.EncapsulatedValue())
 			}
 			e.V = ref.V
 		}
 	default:
-		if err := gocty.FromCtyValue(val, e); err != nil {
+		if err := gocty.FromCtyValue(cv, e); err != nil {
 			return fmt.Errorf("converting cty.Value to %T: %w", e, err)
 		}
 	}
@@ -434,7 +459,7 @@ func (r *Resource) Scan(ext any) error {
 			r.Name = field.String()
 		case ft.isQualifier():
 			if field.Kind() != reflect.String {
-				return errors.New("schemahcl: extension qualifer field must be string")
+				return errors.New("schemahcl: extension qualifier field must be string")
 			}
 			r.Qualifier = field.String()
 		case isResourceSlice(field.Type()):
@@ -493,7 +518,7 @@ func scanPtr(key string, r *Resource, field reflect.Value) error {
 	default:
 		t, err := gocty.ImpliedType(e)
 		if err != nil {
-			return fmt.Errorf("schemahcl: cannot infer type for field %q when scaning pointer: %w", key, err)
+			return fmt.Errorf("schemahcl: cannot infer type for field %q when scanning pointer: %w", key, err)
 		}
 		attr.V, err = gocty.ToCtyValue(e, t)
 		if err != nil {
@@ -544,15 +569,21 @@ func scanAttr(key string, r *Resource, field reflect.Value) error {
 	return nil
 }
 
+// specCache holds a cache for type-spec fields descriptions.
+var specCache sync.Map
+
 // specFields uses reflection to find struct fields that are tagged with "spec"
 // and returns a list of mappings from the tag to the field name.
 func specFields(ext any) []fieldDesc {
 	t := indirect(reflect.TypeOf(ext))
+	if d, ok := specCache.Load(t); ok {
+		return d.([]fieldDesc)
+	}
 	var fields []fieldDesc
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 		tag, ok := f.Tag.Lookup("spec")
-		if !ok {
+		if !ok || tag == "-" {
 			continue
 		}
 		d := fieldDesc{tag: tag, StructField: f}
@@ -561,6 +592,7 @@ func specFields(ext any) []fieldDesc {
 		}
 		fields = append(fields, d)
 	}
+	specCache.Store(t, fields)
 	return fields
 }
 
@@ -591,6 +623,8 @@ type fieldDesc struct {
 func (f fieldDesc) isName() bool { return f.is("name") }
 
 func (f fieldDesc) isQualifier() bool { return f.is("qualifier") }
+
+func (f fieldDesc) isRange() bool { return f.is("range") }
 
 func (f fieldDesc) omitempty() bool { return f.is("omitempty") }
 

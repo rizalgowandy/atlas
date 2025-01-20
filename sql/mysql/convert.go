@@ -39,13 +39,13 @@ func FormatType(t schema.Type) (string, error) {
 		}
 	case *schema.DecimalType:
 		if f = strings.ToLower(t.T); f != TypeDecimal && f != TypeNumeric {
-			return "", fmt.Errorf("mysql: unexpected decimal type: %q", t.T)
+			return "", fmt.Errorf("unexpected decimal type: %q", t.T)
 		}
 		switch p, s := t.Precision, t.Scale; {
 		case p < 0 || s < 0:
-			return "", fmt.Errorf("mysql: decimal type must have precision > 0 and scale >= 0: %d, %d", p, s)
+			return "", fmt.Errorf("decimal type must have precision > 0 and scale >= 0: %d, %d", p, s)
 		case p < s:
-			return "", fmt.Errorf("mysql: decimal type must have precision >= scale: %d < %d", p, s)
+			return "", fmt.Errorf("decimal type must have precision >= scale: %d < %d", p, s)
 		case p == 0 && s == 0:
 			// The default value for precision is 10 (i.e. decimal(0,0) = decimal(10)).
 			p = 10
@@ -99,6 +99,10 @@ func FormatType(t schema.Type) (string, error) {
 		if p := t.Precision; p != nil && *p > 0 {
 			f = fmt.Sprintf("%s(%d)", f, *p)
 		}
+	case *schema.UUIDType:
+		f = strings.ToLower(t.T)
+	case *NetworkType:
+		f = strings.ToLower(t.T)
 	case *schema.UnsupportedType:
 		// Do not accept unsupported types as we should cover all cases.
 		return "", fmt.Errorf("unsupported type %q", t.T)
@@ -159,7 +163,7 @@ func ParseType(raw string) (schema.Type, error) {
 		}
 		if len(parts) > 1 && parts[1] != "unsigned" {
 			if dt.Precision, err = strconv.Atoi(parts[1]); err != nil {
-				return nil, fmt.Errorf("parse precision %q", parts[1])
+				return nil, fmt.Errorf("parse decimal precision %q", parts[1])
 			}
 		}
 		if len(parts) > 2 && parts[2] != "unsigned" {
@@ -175,7 +179,7 @@ func ParseType(raw string) (schema.Type, error) {
 		}
 		if len(parts) > 1 && parts[1] != "unsigned" {
 			if ft.Precision, err = strconv.Atoi(parts[1]); err != nil {
-				return nil, fmt.Errorf("parse precision %q", parts[1])
+				return nil, fmt.Errorf("parse double precision %q", parts[1])
 			}
 		}
 		return ft, nil
@@ -203,7 +207,7 @@ func ParseType(raw string) (schema.Type, error) {
 		// github.com/mysql/mysql-server/blob/8.0/sql/field.cc#Field_enum::sql_type
 		rv := strings.TrimSuffix(strings.TrimPrefix(raw, t+"("), ")")
 		if rv == "" {
-			return nil, fmt.Errorf("mysql: unexpected enum type: %q", raw)
+			return nil, fmt.Errorf("unexpected enum type: %q", raw)
 		}
 		values := strings.Split(rv, "','")
 		for i := range values {
@@ -225,7 +229,7 @@ func ParseType(raw string) (schema.Type, error) {
 		if len(parts) > 1 {
 			p, err := strconv.Atoi(parts[1])
 			if err != nil {
-				return nil, fmt.Errorf("parse precision %q", parts[1])
+				return nil, fmt.Errorf("parse timestamp precision %q", parts[1])
 			}
 			tt.Precision = &p
 		}
@@ -236,6 +240,14 @@ func ParseType(raw string) (schema.Type, error) {
 		}, nil
 	case TypePoint, TypeMultiPoint, TypeLineString, TypeMultiLineString, TypePolygon, TypeMultiPolygon, TypeGeometry, TypeGeoCollection, TypeGeometryCollection:
 		return &schema.SpatialType{
+			T: t,
+		}, nil
+	case TypeUUID:
+		return &schema.UUIDType{
+			T: t,
+		}, nil
+	case TypeInet4, TypeInet6:
+		return &NetworkType{
 			T: t,
 		}, nil
 	default:

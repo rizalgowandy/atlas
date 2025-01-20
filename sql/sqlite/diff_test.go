@@ -27,34 +27,28 @@ func TestDiff_TableDiff(t *testing.T) {
 			to:   &schema.Table{Name: "users"},
 		},
 		{
-			name: "change primary key",
-			from: func() *schema.Table {
-				t := &schema.Table{Name: "users", Schema: &schema.Schema{Name: "public"}, Columns: []*schema.Column{{Name: "id", Type: &schema.ColumnType{Raw: "int", Type: &schema.IntegerType{T: "int"}}}}}
-				t.PrimaryKey = &schema.Index{
-					Parts: []*schema.IndexPart{{C: t.Columns[0]}},
-				}
-				return t
-			}(),
-			to:      &schema.Table{Name: "users"},
-			wantErr: true,
-		},
-		{
-			name: "add attr",
+			name: "add attrs",
 			from: &schema.Table{Name: "t1", Schema: &schema.Schema{Name: "public"}},
-			to:   &schema.Table{Name: "t1", Attrs: []schema.Attr{&WithoutRowID{}}},
+			to:   &schema.Table{Name: "t1", Attrs: []schema.Attr{&WithoutRowID{}, &Strict{}}},
 			wantChanges: []schema.Change{
 				&schema.AddAttr{
 					A: &WithoutRowID{},
 				},
+				&schema.AddAttr{
+					A: &Strict{},
+				},
 			},
 		},
 		{
-			name: "drop attr",
-			from: &schema.Table{Name: "t1", Attrs: []schema.Attr{&WithoutRowID{}}},
+			name: "drop attrs",
+			from: &schema.Table{Name: "t1", Attrs: []schema.Attr{&WithoutRowID{}, &Strict{}}},
 			to:   &schema.Table{Name: "t1"},
 			wantChanges: []schema.Change{
 				&schema.DropAttr{
 					A: &WithoutRowID{},
+				},
+				&schema.DropAttr{
+					A: &Strict{},
 				},
 			},
 		},
@@ -114,7 +108,6 @@ func TestDiff_TableDiff(t *testing.T) {
 							Name:    "c1",
 							Type:    &schema.ColumnType{Raw: "json", Type: &schema.JSONType{T: "json"}, Null: true},
 							Default: &schema.RawExpr{X: "{}"},
-							Attrs:   []schema.Attr{&schema.Comment{Text: "json comment"}},
 						},
 						{Name: "c3", Type: &schema.ColumnType{Raw: "int", Type: &schema.IntegerType{T: "int"}}},
 					},
@@ -128,7 +121,7 @@ func TestDiff_TableDiff(t *testing.T) {
 					&schema.ModifyColumn{
 						From:   from.Columns[0],
 						To:     to.Columns[0],
-						Change: schema.ChangeNull | schema.ChangeComment | schema.ChangeDefault,
+						Change: schema.ChangeNull | schema.ChangeDefault,
 					},
 					&schema.DropColumn{C: from.Columns[1]},
 					&schema.AddColumn{C: to.Columns[1]},
@@ -225,6 +218,31 @@ func TestDiff_TableDiff(t *testing.T) {
 					&schema.ModifyIndex{From: from.Indexes[2], To: to.Indexes[2], Change: schema.ChangeAttr},
 					&schema.ModifyIndex{From: from.Indexes[3], To: to.Indexes[3], Change: schema.ChangeParts},
 					&schema.AddIndex{I: to.Indexes[1]},
+				},
+			}
+		}(),
+		func() testcase {
+			from := schema.NewTable("t1").
+				SetSchema(schema.New("test")).
+				AddColumns(schema.NewStringColumn("id", "varchar"), schema.NewBoolColumn("active", "bool"))
+			from.SetPrimaryKey(schema.NewPrimaryKey(from.Columns...))
+			to := schema.NewTable("t1").
+				SetSchema(schema.New("test")).
+				AddColumns(schema.NewStringColumn("id", "varchar"), schema.NewBoolColumn("active", "bool"))
+			to.SetPrimaryKey(
+				schema.NewPrimaryKey(from.Columns...).
+					AddAttrs(&IndexPredicate{P: "active"}),
+			)
+			return testcase{
+				name: "modify primary-key",
+				from: from,
+				to:   to,
+				wantChanges: []schema.Change{
+					&schema.ModifyPrimaryKey{
+						From:   from.PrimaryKey,
+						To:     to.PrimaryKey,
+						Change: schema.ChangeAttr,
+					},
 				},
 			}
 		}(),
@@ -328,4 +346,17 @@ func TestDiff_SchemaDiff(t *testing.T) {
 		&schema.DropTable{T: from.Tables[1]},
 		&schema.AddTable{T: to.Tables[1]},
 	}, changes)
+}
+
+func TestDefaultDiff(t *testing.T) {
+	changes, err := DefaultDiff.SchemaDiff(
+		schema.New("main").
+			AddTables(
+				schema.NewTable("users").AddColumns(schema.NewIntColumn("id", "int")),
+			),
+		schema.New("main"),
+	)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	require.IsType(t, &schema.DropTable{}, changes[0])
 }

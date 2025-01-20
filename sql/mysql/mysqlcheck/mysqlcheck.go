@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"ariga.io/atlas/schemahcl"
+	"ariga.io/atlas/sql/internal/sqlx"
 	"ariga.io/atlas/sql/migrate"
 	"ariga.io/atlas/sql/mysql"
 	"ariga.io/atlas/sql/schema"
@@ -18,6 +19,8 @@ import (
 	"ariga.io/atlas/sql/sqlcheck/condrop"
 	"ariga.io/atlas/sql/sqlcheck/datadepend"
 	"ariga.io/atlas/sql/sqlcheck/destructive"
+	"ariga.io/atlas/sql/sqlcheck/incompatible"
+	"ariga.io/atlas/sql/sqlcheck/naming"
 )
 
 var (
@@ -57,11 +60,13 @@ func addNotNull(p *datadepend.ColumnPass) (diags []sqlcheck.Diagnostic, err erro
 	}
 	switch ct := p.Column.Type.Type.(type) {
 	case *mysql.BitType, *schema.BoolType, *schema.IntegerType, *schema.DecimalType, *schema.FloatType, *schema.BinaryType:
-		tt, err := mysql.FormatType(p.Column.Type.Type)
-		if err != nil {
-			return nil, err
+		if !sqlx.Has(p.Column.Attrs, &mysql.AutoIncrement{}) {
+			tt, err := mysql.FormatType(p.Column.Type.Type)
+			if err != nil {
+				return nil, err
+			}
+			implicitUpdate(tt, "0")
 		}
-		implicitUpdate(tt, "0")
 	case *schema.StringType:
 		switch ct.T {
 		case mysql.TypeVarchar, mysql.TypeChar:
@@ -140,12 +145,16 @@ func addNotNull(p *datadepend.ColumnPass) (diags []sqlcheck.Diagnostic, err erro
 // columnFilledAfter checks if the column with the given value was filled after the current change.
 func columnFilledAfter(pass *datadepend.ColumnPass, matchValue string) bool {
 	p, ok := pass.File.Parser.(interface {
-		ColumnFilledAfter(migrate.File, *schema.Table, *schema.Column, int, any) (bool, error)
+		ColumnFilledAfter([]*migrate.Stmt, *schema.Table, *schema.Column, int, any) (bool, error)
 	})
 	if !ok {
 		return false
 	}
-	filled, _ := p.ColumnFilledAfter(pass.File, pass.Table, pass.Column, pass.Change.Stmt.Pos, matchValue)
+	stmts, err := migrate.FileStmtDecls(pass.Dev, pass.File)
+	if err != nil {
+		return false
+	}
+	filled, _ := p.ColumnFilledAfter(stmts, pass.Table, pass.Column, pass.Change.Stmt.Pos, matchValue)
 	return filled
 }
 
@@ -195,22 +204,28 @@ func inlineRefs(_ context.Context, p *sqlcheck.Pass) error {
 	return nil
 }
 
-func init() {
-	sqlcheck.Register(mysql.DriverName, func(r *schemahcl.Resource) ([]sqlcheck.Analyzer, error) {
-		ds, err := destructive.New(r)
-		if err != nil {
-			return nil, err
-		}
-		cd, err := condrop.New(r)
-		if err != nil {
-			return nil, err
-		}
-		dd, err := datadepend.New(r, datadepend.Handler{
-			AddNotNull: addNotNull,
-		})
-		if err != nil {
-			return nil, err
-		}
-		return []sqlcheck.Analyzer{ds, dd, cd, sqlcheck.AnalyzerFunc(inlineRefs)}, nil
+func analyzers(r *schemahcl.Resource) ([]sqlcheck.Analyzer, error) {
+	ds, err := destructive.New(r)
+	if err != nil {
+		return nil, err
+	}
+	cd, err := condrop.New(r)
+	if err != nil {
+		return nil, err
+	}
+	dd, err := datadepend.New(r, datadepend.Handler{
+		AddNotNull: addNotNull,
 	})
+	if err != nil {
+		return nil, err
+	}
+	bc, err := incompatible.New(r)
+	if err != nil {
+		return nil, err
+	}
+	nm, err := naming.New(r)
+	if err != nil {
+		return nil, err
+	}
+	return []sqlcheck.Analyzer{ds, dd, cd, bc, nm, sqlcheck.AnalyzerFunc(inlineRefs)}, nil
 }

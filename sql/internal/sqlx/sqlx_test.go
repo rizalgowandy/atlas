@@ -5,6 +5,7 @@
 package sqlx
 
 import (
+	"errors"
 	"strconv"
 	"testing"
 
@@ -25,6 +26,17 @@ func TestModeInspectRealm(t *testing.T) {
 	m = ModeInspectRealm(&schema.InspectRealmOption{Mode: schema.InspectSchemas})
 	require.True(t, m.Is(schema.InspectSchemas))
 	require.False(t, m.Is(schema.InspectTables))
+
+	m = ModeInspectRealm(&schema.InspectRealmOption{Exclude: []string{"*.*"}})
+	require.Equal(t, schema.InspectSchemas, m)
+	m = ModeInspectRealm(&schema.InspectRealmOption{Exclude: []string{"*"}})
+	require.NotEqual(t, schema.InspectSchemas, m)
+	require.True(t, m.Is(schema.InspectSchemas))
+	require.True(t, m.Is(schema.InspectTables))
+	m = ModeInspectRealm(&schema.InspectRealmOption{Mode: schema.InspectFuncs, Exclude: []string{"*.*"}})
+	require.NotEqual(t, schema.InspectSchemas, m)
+	require.True(t, m.Is(schema.InspectFuncs))
+	require.False(t, m.Is(schema.InspectTables))
 }
 
 func TestModeInspectSchema(t *testing.T) {
@@ -39,11 +51,22 @@ func TestModeInspectSchema(t *testing.T) {
 	m = ModeInspectSchema(&schema.InspectOptions{Mode: schema.InspectSchemas})
 	require.True(t, m.Is(schema.InspectSchemas))
 	require.False(t, m.Is(schema.InspectTables))
+
+	m = ModeInspectSchema(&schema.InspectOptions{Exclude: []string{"*"}})
+	require.Equal(t, schema.InspectSchemas, m)
+	m = ModeInspectSchema(&schema.InspectOptions{Exclude: []string{"*.*"}})
+	require.NotEqual(t, schema.InspectSchemas, m)
+	require.True(t, m.Is(schema.InspectSchemas))
+	require.True(t, m.Is(schema.InspectTables))
+	m = ModeInspectSchema(&schema.InspectOptions{Mode: schema.InspectFuncs, Exclude: []string{"*"}})
+	require.NotEqual(t, schema.InspectSchemas, m)
+	require.True(t, m.Is(schema.InspectFuncs))
+	require.False(t, m.Is(schema.InspectTables))
 }
 
 func TestBuilder(t *testing.T) {
 	var (
-		b       = &Builder{QuoteChar: '"'}
+		b       = &Builder{QuoteOpening: '"', QuoteClosing: '"'}
 		columns = []string{"a", "b", "c"}
 	)
 	b.P("CREATE TABLE").
@@ -59,12 +82,16 @@ func TestBuilder(t *testing.T) {
 			})
 		})
 	require.Equal(t, `CREATE TABLE "users" ("a" int NOT NULL, "b" int NOT NULL, "c" int NOT NULL, PRIMARY KEY ("a", "b", "c"))`, b.String())
+
+	// WrapErr.
+	require.EqualError(t, b.WrapErr(func(*Builder) error { return errors.New("oops") }), "oops")
+	require.EqualError(t, b.WrapIndentErr(func(*Builder) error { return errors.New("oops") }), "oops")
 }
 
 func TestBuilder_Qualifier(t *testing.T) {
 	var (
 		s = "other"
-		b = &Builder{QuoteChar: '"', Schema: &s}
+		b = &Builder{QuoteOpening: '"', QuoteClosing: '"', Schema: &s}
 	)
 	b.P("CREATE TABLE").Table(schema.NewTable("users"))
 	require.Equal(t, `CREATE TABLE "other"."users"`, b.String())
@@ -79,9 +106,21 @@ func TestBuilder_Qualifier(t *testing.T) {
 	b.Reset()
 	b.P("CREATE TABLE").Table(schema.NewTable("users").SetSchema(schema.New("test")))
 	require.Equal(t, `CREATE TABLE "users"`, b.String())
-
 }
 
+func TestQuote(t *testing.T) {
+	var (
+		s = "s1"
+		b = &Builder{QuoteOpening: '[', QuoteClosing: ']', Schema: &s}
+	)
+	b.P("EXECUTE sp_rename").
+		P("@newname = N'c2'").Comma().
+		P("@objtype = N'COLUMN'").Comma()
+	b.P("@objname = ").Quote("N", func(b *Builder) {
+		b.TableResource(schema.NewTable("t1"), &schema.Column{Name: "c1"})
+	})
+	require.Equal(t, `EXECUTE sp_rename @newname = N'c2', @objtype = N'COLUMN', @objname = N'[s1].[t1].[c1]'`, b.String())
+}
 func TestMayWrap(t *testing.T) {
 	tests := []struct {
 		input   string
@@ -112,7 +151,6 @@ func TestMayWrap(t *testing.T) {
 				expect = "(" + expect + ")"
 			}
 			require.Equal(t, expect, MayWrap(tt.input))
-
 		})
 	}
 }
@@ -232,6 +270,32 @@ func TestReverseChanges(t *testing.T) {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
 			ReverseChanges(tt.input)
 			require.Equal(t, tt.expect, tt.input)
+		})
+	}
+}
+
+func TestIsUint(t *testing.T) {
+	require.True(t, IsUint("1"))
+	require.False(t, IsUint("-1"))
+	require.False(t, IsUint("1.2"))
+	require.False(t, IsUint("1.2.3"))
+}
+
+func TestBodyDefChanged(t *testing.T) {
+	for i, tt := range []struct {
+		from, to string
+		changed  bool
+	}{
+		{"", "", false},
+		{"a", "a", false},
+		{"a", "b", true},
+		{"select 1;", "select 1", false},
+		{"\nselect 1\n", "\nselect 1;", false},
+		{"\nselect \n  \n1\n", "\nselect \n\n1;", false},
+		{"\nselect \n  \n1\n'  '", "\nselect \n\n' ';", true},
+	} {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			require.Equal(t, tt.changed, BodyDefChanged(tt.from, tt.to))
 		})
 	}
 }

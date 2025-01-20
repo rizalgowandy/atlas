@@ -7,6 +7,7 @@ package sqlite
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"ariga.io/atlas/sql/internal/sqlx"
@@ -14,8 +15,13 @@ import (
 	"ariga.io/atlas/sql/schema"
 )
 
+// DefaultPlan provides basic planning capabilities for SQLite dialects.
+// Note, it is recommended to call Open, create a new Driver and use its
+// migrate.PlanApplier when a database connection is available.
+var DefaultPlan migrate.PlanApplier = &planApply{conn: &conn{ExecQuerier: sqlx.NoRows}}
+
 // A planApply provides migration capabilities for schema elements.
-type planApply struct{ conn }
+type planApply struct{ *conn }
 
 // PlanChanges returns a migration plan for the given schema changes.
 func (p *planApply) PlanChanges(ctx context.Context, name string, changes []schema.Change, opts ...migrate.PlanOption) (*migrate.Plan, error) {
@@ -23,7 +29,6 @@ func (p *planApply) PlanChanges(ctx context.Context, name string, changes []sche
 		conn: p.conn,
 		Plan: migrate.Plan{
 			Name:          name,
-			Reversible:    true,
 			Transactional: true,
 		},
 		PlanOptions: migrate.PlanOptions{
@@ -35,13 +40,22 @@ func (p *planApply) PlanChanges(ctx context.Context, name string, changes []sche
 	for _, o := range opts {
 		o(&s.PlanOptions)
 	}
+	if err := verifyChanges(ctx, changes); err != nil {
+		return nil, err
+	}
 	if err := s.plan(ctx, changes); err != nil {
 		return nil, err
 	}
-	for _, c := range s.Changes {
-		if c.Reverse == "" {
-			s.Reversible = false
-		}
+	if err := sqlx.SetReversible(&s.Plan); err != nil {
+		return nil, err
+	}
+	// Disable foreign-keys enforcement if it is required
+	// by one of the changes in the plan.
+	if s.skipFKs {
+		// Callers should note that these 2 pragmas are no-op in transactions,
+		// See: https://sqlite.org/pragma.html#pragma_foreign_keys.
+		s.Changes = append([]*migrate.Change{{Cmd: "PRAGMA foreign_keys = off", Comment: "disable the enforcement of foreign-keys constraints"}}, s.Changes...)
+		s.append(&migrate.Change{Cmd: "PRAGMA foreign_keys = on", Comment: "enable back the enforcement of foreign-keys constraints"})
 	}
 	return &s.Plan, nil
 }
@@ -57,7 +71,7 @@ func (p *planApply) ApplyChanges(ctx context.Context, changes []schema.Change, o
 // planApply so that multiple planning/applying can be called
 // in parallel.
 type state struct {
-	conn
+	*conn
 	migrate.Plan
 	migrate.PlanOptions
 	skipFKs bool
@@ -71,25 +85,29 @@ func (s *state) plan(ctx context.Context, changes []schema.Change) (err error) {
 		case *schema.AddTable:
 			err = s.addTable(ctx, c)
 		case *schema.DropTable:
-			err = s.dropTable(c)
+			err = s.dropTable(ctx, c)
 		case *schema.ModifyTable:
 			err = s.modifyTable(ctx, c)
 		case *schema.RenameTable:
 			s.renameTable(c)
+		case *schema.AddView:
+			err = s.addView(c)
+		case *schema.DropView:
+			err = s.dropView(c)
+		case *schema.ModifyView:
+			err = s.modifyView(c)
+		case *schema.RenameView:
+			err = s.renameView(c)
+		case *schema.AddTrigger:
+			err = s.addTrigger(c)
+		case *schema.DropTrigger:
+			err = s.dropTrigger(c)
 		default:
 			err = fmt.Errorf("unsupported change %T", c)
 		}
 		if err != nil {
 			return err
 		}
-	}
-	// Disable foreign-keys enforcement if it is required
-	// by one of the changes in the plan.
-	if s.skipFKs {
-		// Callers should note that these 2 pragmas are no-op in transactions,
-		// See: https://sqlite.org/pragma.html#pragma_foreign_keys.
-		s.Changes = append([]*migrate.Change{{Cmd: "PRAGMA foreign_keys = off", Comment: "disable the enforcement of foreign-keys constraints"}}, s.Changes...)
-		s.append(&migrate.Change{Cmd: "PRAGMA foreign_keys = on", Comment: "enable back the enforcement of foreign-keys constraints"})
 	}
 	return nil
 }
@@ -103,15 +121,15 @@ func (s *state) addTable(ctx context.Context, add *schema.AddTable) error {
 	if sqlx.Has(add.Extra, &schema.IfNotExists{}) {
 		b.P("IF NOT EXISTS")
 	}
-	b.Wrap(func(b *sqlx.Builder) {
-		b.MapComma(add.T.Columns, func(i int, b *sqlx.Builder) {
+	b.WrapIndent(func(b *sqlx.Builder) {
+		b.MapIndent(add.T.Columns, func(i int, b *sqlx.Builder) {
 			if err := s.column(b, add.T.Columns[i]); err != nil {
 				errs = append(errs, err.Error())
 			}
 		})
 		// Primary keys with auto-increment are inlined on the column definition.
 		if pk := add.T.PrimaryKey; pk != nil && !autoincPK(pk) {
-			b.Comma().P("PRIMARY KEY")
+			b.Comma().NL().P("PRIMARY KEY")
 			s.indexParts(b, pk.Parts)
 		}
 		if len(add.T.ForeignKeys) > 0 {
@@ -120,7 +138,7 @@ func (s *state) addTable(ctx context.Context, add *schema.AddTable) error {
 		}
 		for _, attr := range add.T.Attrs {
 			if c, ok := attr.(*schema.Check); ok {
-				b.Comma()
+				b.Comma().NL()
 				check(b, c)
 			}
 		}
@@ -128,9 +146,16 @@ func (s *state) addTable(ctx context.Context, add *schema.AddTable) error {
 	if len(errs) > 0 {
 		return fmt.Errorf("create table %q: %s", add.T.Name, strings.Join(errs, ", "))
 	}
-	if p := (WithoutRowID{}); sqlx.Has(add.T.Attrs, &p) {
-		b.P("WITHOUT ROWID")
+	var options []string
+	if sqlx.Has(add.T.Attrs, &WithoutRowID{}) {
+		options = append(options, "WITHOUT ROWID")
 	}
+	if sqlx.Has(add.T.Attrs, &Strict{}) {
+		options = append(options, "STRICT")
+	}
+	b.MapComma(options, func(i int, b *sqlx.Builder) {
+		b.P(options[i])
+	})
 	s.append(&migrate.Change{
 		Cmd:     b.String(),
 		Source:  add,
@@ -144,16 +169,33 @@ func (s *state) addTable(ctx context.Context, add *schema.AddTable) error {
 }
 
 // dropTable builds and executes the query for dropping a table from a schema.
-func (s *state) dropTable(drop *schema.DropTable) error {
+func (s *state) dropTable(ctx context.Context, drop *schema.DropTable) error {
+	rs := &state{conn: s.conn, PlanOptions: s.PlanOptions}
+	if err := rs.addTable(ctx, &schema.AddTable{T: drop.T}); err != nil {
+		return fmt.Errorf("calculate reverse for drop table %q: %w", drop.T.Name, err)
+	}
 	s.skipFKs = true
-	b := s.Build("DROP TABLE").Ident(drop.T.Name)
+	b := s.Build("DROP TABLE")
 	if sqlx.Has(drop.Extra, &schema.IfExists{}) {
 		b.P("IF EXISTS")
 	}
+	b.Ident(drop.T.Name)
 	s.append(&migrate.Change{
 		Cmd:     b.String(),
 		Source:  drop,
 		Comment: fmt.Sprintf("drop %q table", drop.T.Name),
+		// The reverse of 'DROP TABLE' might be a multi
+		// statement operation. e.g., table with indexes.
+		Reverse: func() any {
+			cmd := make([]string, len(rs.Changes))
+			for i, c := range rs.Changes {
+				cmd[i] = c.Cmd
+			}
+			if len(cmd) == 1 {
+				return cmd[0]
+			}
+			return cmd
+		}(),
 	})
 	return nil
 }
@@ -244,7 +286,7 @@ func (s *state) dropIndexes(t *schema.Table, indexes ...*schema.Index) error {
 	}
 	for i := range rs.Changes {
 		s.append(&migrate.Change{
-			Cmd:     rs.Changes[i].Reverse,
+			Cmd:     rs.Changes[i].Reverse.(string),
 			Reverse: rs.Changes[i].Cmd,
 			Comment: fmt.Sprintf("drop index %q from table: %q", indexes[i].Name, t.Name),
 		})
@@ -254,25 +296,8 @@ func (s *state) dropIndexes(t *schema.Table, indexes ...*schema.Index) error {
 
 func (s *state) addIndexes(t *schema.Table, indexes ...*schema.Index) error {
 	for _, idx := range indexes {
-		// PRIMARY KEY or UNIQUE columns automatically create indexes with the generated name.
-		// See: sqlite/build.c#sqlite3CreateIndex. Therefore, we ignore such PKs, but create
-		// the inlined UNIQUE constraints manually with custom name, because SQLite does not
-		// allow creating indexes with such names manually. Note, this case is possible if
-		// "apply" schema that was inspected from the database as-is.
-		if strings.HasPrefix(idx.Name, "sqlite_autoindex") {
-			if i := (IndexOrigin{}); sqlx.Has(idx.Attrs, &i) && i.O == "p" {
-				continue
-			}
-			// Use the following format: <Table>_<Columns>.
-			names := make([]string, len(idx.Parts)+1)
-			names[0] = t.Name
-			for i, p := range idx.Parts {
-				if p.C == nil {
-					return fmt.Errorf("unexpected index part %s (%d)", idx.Name, i)
-				}
-				names[i+1] = p.C.Name
-			}
-			idx.Name = strings.Join(names, "_")
+		if err := normalizeIdxName(idx, t); err != nil {
+			return err
 		}
 		b := s.Build("CREATE")
 		if idx.Unique {
@@ -297,6 +322,31 @@ func (s *state) addIndexes(t *schema.Table, indexes ...*schema.Index) error {
 	return nil
 }
 
+// normalizeIdxName normalizes the index name before generating the CREATE INDEX statement.
+func normalizeIdxName(idx *schema.Index, t *schema.Table) error {
+	// PRIMARY KEY or UNIQUE columns automatically create indexes with the generated name.
+	// See: sqlite/build.c#sqlite3CreateIndex. Therefore, we ignore such PKs, but create
+	// the inlined UNIQUE constraints manually with custom name, because SQLite does not
+	// allow creating indexes with such names manually. Note, this case is possible if
+	// "apply" schema that was inspected from the database as-is.
+	if strings.HasPrefix(idx.Name, "sqlite_autoindex") {
+		if i := (IndexOrigin{}); sqlx.Has(idx.Attrs, &i) && i.O == "p" {
+			return nil
+		}
+		// Use the following format: <Table>_<Columns>.
+		names := make([]string, len(idx.Parts)+1)
+		names[0] = t.Name
+		for i, p := range idx.Parts {
+			if p.C == nil {
+				return fmt.Errorf("unexpected index part %s (%d)", idx.Name, i)
+			}
+			names[i+1] = p.C.Name
+		}
+		idx.Name = strings.Join(names, "_")
+	}
+	return nil
+}
+
 func (s *state) indexParts(b *sqlx.Builder, parts []*schema.IndexPart) {
 	b.Wrap(func(b *sqlx.Builder) {
 		b.MapComma(parts, func(i int, b *sqlx.Builder) {
@@ -314,7 +364,7 @@ func (s *state) indexParts(b *sqlx.Builder, parts []*schema.IndexPart) {
 }
 
 func (s *state) fks(b *sqlx.Builder, fks ...*schema.ForeignKey) {
-	b.MapComma(fks, func(i int, b *sqlx.Builder) {
+	b.MapIndent(fks, func(i int, b *sqlx.Builder) {
 		fk := fks[i]
 		if fk.Symbol != "" {
 			b.P("CONSTRAINT").Ident(fk.Symbol)
@@ -367,6 +417,14 @@ func (s *state) copyRows(from *schema.Table, to *schema.Table, changes []schema.
 					return false, fmt.Errorf("duplicate changes for column: %q: %T, %T", column.Name, change, c)
 				}
 				change = changes[i]
+			case *schema.RenameColumn:
+				if c.To.Name != column.Name {
+					break
+				}
+				if change != nil {
+					return false, fmt.Errorf("duplicate changes for column: %q: %T, %T", column.Name, change, c)
+				}
+				change = changes[i]
 			case *schema.DropColumn:
 				if c.C.Name == column.Name {
 					return false, fmt.Errorf("unexpected drop column: %q", column.Name)
@@ -390,6 +448,9 @@ func (s *state) copyRows(from *schema.Table, to *schema.Table, changes []schema.
 			} else {
 				fromC = append(fromC, column.Name)
 			}
+		case *schema.RenameColumn:
+			toC = append(toC, change.To.Name)
+			fromC = append(fromC, change.From.Name)
 		// Columns without changes should be transferred as-is.
 		case nil:
 			toC = append(toC, column.Name)
@@ -461,7 +522,7 @@ func (s *state) alterTable(modify *schema.ModifyTable) error {
 func (s *state) tableSeq(ctx context.Context, add *schema.AddTable) error {
 	var inc AutoIncrement
 	switch pk := add.T.PrimaryKey; {
-	// Sequence was set on the table.
+	// Sequence was set on table attributes.
 	case sqlx.Has(add.T.Attrs, &inc) && inc.Seq > 0:
 	// Sequence was set on table primary-key (a single column PK).
 	case pk != nil && len(pk.Parts) == 1 && pk.Parts[0].C != nil && sqlx.Has(pk.Parts[0].C.Attrs, &inc) && inc.Seq > 0:
@@ -482,7 +543,8 @@ func (s *state) tableSeq(ctx context.Context, add *schema.AddTable) error {
 		})
 	}
 	if rows != nil {
-		return rows.Close()
+		rows.Close()
+		return rows.Err()
 	}
 	return nil
 }
@@ -496,7 +558,17 @@ func alterable(modify *schema.ModifyTable) bool {
 		switch change := change.(type) {
 		case *schema.RenameColumn, *schema.RenameIndex, *schema.DropIndex, *schema.AddIndex:
 		case *schema.AddColumn:
-			if len(change.C.Indexes) > 0 || len(change.C.ForeignKeys) > 0 || change.C.Default != nil {
+			if len(change.C.Indexes) > 0 || len(change.C.ForeignKeys) > 0 {
+				return false
+			}
+			// If the column has a DEFAULT clause, it must be a constant value.
+			// See: https://www.sqlite.org/lang_altertable.html#alter_table_add_column.
+			switch x := change.C.Default.(type) {
+			case *schema.Literal:
+				if slices.Contains([]string{"CURRENT_TIME", "CURRENT_DATE", "CURRENT_TIMESTAMP"}, x.V) {
+					return false
+				}
+			case *schema.RawExpr:
 				return false
 			}
 			// Only VIRTUAL generated columns can be added using ALTER TABLE.
@@ -530,8 +602,8 @@ func autoincPK(pk *schema.Index) bool {
 
 // Build instantiates a new builder and writes the given phrase to it.
 func (s *state) Build(phrases ...string) *sqlx.Builder {
-	b := &sqlx.Builder{QuoteChar: '`', Schema: s.SchemaQualifier}
-	return b.P(phrases...)
+	return (*Driver).StmtBuilder(nil, s.PlanOptions).
+		P(phrases...)
 }
 
 func defaultValue(c *schema.Column) (string, error) {
@@ -544,14 +616,14 @@ func defaultValue(c *schema.Column) (string, error) {
 			return sqlx.SingleQuote(x.V)
 		}
 	case *schema.RawExpr:
-		return x.X, nil
+		return sqlx.MayWrap(x.X), nil
 	default:
 		return "", fmt.Errorf("unexpected default value type: %T", x)
 	}
 }
 
 func identComma(c []string) string {
-	b := &sqlx.Builder{QuoteChar: '`'}
+	b := &sqlx.Builder{QuoteOpening: '`', QuoteClosing: '`'}
 	b.MapComma(c, func(i int, b *sqlx.Builder) {
 		if strings.ContainsRune(c[i], '`') {
 			b.WriteString(c[i])

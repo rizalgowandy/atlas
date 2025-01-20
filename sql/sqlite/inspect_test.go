@@ -30,6 +30,7 @@ func TestDriver_InspectTable(t *testing.T) {
 					WillReturnRows(sqltest.Rows(`
  name |   type       | nullable | dflt_value  | primary  | hidden
 ------+--------------+----------+ ------------+----------+----------
+ id   | integer       |  0      |     0x1     |  1       |  0
  c1   | int           |  1      |     a       |  0       |  0
  c2   | integer       |  0      |     97      |  0       |  0
  c3   | varchar(100)  |  1      |    'A'      |  0       |  0
@@ -40,10 +41,11 @@ func TestDriver_InspectTable(t *testing.T) {
  c8   | text          |  0      |             |  0       |  0
  c9   | numeric(10,2) |  0      |             |  0       |  0
  c10  | real          |  0      |             |  0       |  0
+ c11  |               |  0      |             |  0       |  0
  w    | int           |  0      |             |  0       |  2
  x    | text          |  0      |             |  0       |  3
  y    | text          |  0      |             |  0       |  2
- id   | integer       |  0      |     0x1     |  1       |  0
+ j    | jsonb         |  0      |             |  0       |  0
 `))
 				m.noIndexes("users")
 				m.noFKs("users")
@@ -51,6 +53,7 @@ func TestDriver_InspectTable(t *testing.T) {
 			expect: func(require *require.Assertions, t *schema.Table, err error) {
 				require.NoError(err)
 				columns := []*schema.Column{
+					{Name: "id", Type: &schema.ColumnType{Type: &schema.IntegerType{T: "integer"}, Raw: "integer"}, Attrs: []schema.Attr{&AutoIncrement{}}, Default: &schema.Literal{V: "0x1"}},
 					{Name: "c1", Type: &schema.ColumnType{Null: true, Type: &schema.IntegerType{T: "int"}, Raw: "int"}, Default: &schema.RawExpr{X: "a"}},
 					{Name: "c2", Type: &schema.ColumnType{Type: &schema.IntegerType{T: "integer"}, Raw: "integer"}, Default: &schema.Literal{V: "97"}},
 					{Name: "c3", Type: &schema.ColumnType{Null: true, Type: &schema.StringType{T: "varchar", Size: 100}, Raw: "varchar(100)"}, Default: &schema.Literal{V: "'A'"}},
@@ -61,17 +64,18 @@ func TestDriver_InspectTable(t *testing.T) {
 					{Name: "c8", Type: &schema.ColumnType{Type: &schema.StringType{T: "text"}, Raw: "text"}},
 					{Name: "c9", Type: &schema.ColumnType{Type: &schema.DecimalType{T: "numeric", Precision: 10, Scale: 2}, Raw: "numeric(10,2)"}},
 					{Name: "c10", Type: &schema.ColumnType{Type: &schema.FloatType{T: "real"}, Raw: "real"}},
+					{Name: "c11", Type: &schema.ColumnType{Type: &schema.BinaryType{T: "blob"}, Raw: ""}},
 					{Name: "w", Type: &schema.ColumnType{Type: &schema.IntegerType{T: "int"}, Raw: "int"}, Attrs: []schema.Attr{&schema.GeneratedExpr{Type: "VIRTUAL", Expr: "(a*10)"}}},
 					{Name: "x", Type: &schema.ColumnType{Type: &schema.StringType{T: "text"}, Raw: "text"}, Attrs: []schema.Attr{&schema.GeneratedExpr{Type: "STORED", Expr: "(typeof(c))"}}},
 					{Name: "y", Type: &schema.ColumnType{Type: &schema.StringType{T: "text"}, Raw: "text"}, Attrs: []schema.Attr{&schema.GeneratedExpr{Type: "VIRTUAL", Expr: "(substr(b,a,a+2))"}}},
-					{Name: "id", Type: &schema.ColumnType{Type: &schema.IntegerType{T: "integer"}, Raw: "integer"}, Attrs: []schema.Attr{&AutoIncrement{}}, Default: &schema.Literal{V: "0x1"}},
+					{Name: "j", Type: &schema.ColumnType{Type: &schema.JSONType{T: "jsonb"}, Raw: "jsonb"}},
 				}
 				require.Equal(t.Columns, columns)
 				require.EqualValues(&schema.Index{
 					Name:   "PRIMARY",
 					Unique: true,
 					Table:  t,
-					Parts:  []*schema.IndexPart{{SeqNo: 1, C: columns[len(columns)-1]}},
+					Parts:  []*schema.IndexPart{{SeqNo: 1, C: columns[0]}},
 					Attrs:  []schema.Attr{&AutoIncrement{}},
 				}, t.PrimaryKey)
 			},
@@ -86,6 +90,7 @@ func TestDriver_InspectTable(t *testing.T) {
 ------+--------------+----------+ ------------+----------+----------
  c1   | int           |  1      |             |  0       |  0
  c2   | integer       |  0      |             |  0       |  0
+ c3   | json          |  0      |             |  0       |  0
 `))
 				m.ExpectQuery(sqltest.Escape(fmt.Sprintf(indexesQuery, "users"))).
 					WillReturnRows(sqltest.Rows(`
@@ -94,6 +99,7 @@ func TestDriver_InspectTable(t *testing.T) {
  c1u   |  1           |  c     |  0       | CREATE UNIQUE INDEX c1u on users(c1, c2)
  c1_c2 |  0           |  c     |  1       | CREATE INDEX c1_c2 on users(c1, c2*2) WHERE c1 <> NULL
  c1_x  |  0           |  c     |  0       | CREATE INDEX c1_x ON users (f(c1))
+ c3_x  |  0           |  c     |  0       | CREATE INDEX c3_x ON users (json_extract(c3, '$.x') desc, json_extract(c3, '$.y') desc)
 `))
 				m.ExpectQuery(sqltest.Escape(fmt.Sprintf(indexColumnsQuery, "c1u"))).
 					WillReturnRows(sqltest.Rows(`
@@ -115,6 +121,13 @@ func TestDriver_InspectTable(t *testing.T) {
 -------+--------+
  nil   |  0     |
 `))
+				m.ExpectQuery(sqltest.Escape(fmt.Sprintf(indexColumnsQuery, "c3_x"))).
+					WillReturnRows(sqltest.Rows(`
+ name  |   desc |
+-------+--------+
+ nil   |  1     |
+ nil   |  1     |
+`))
 				m.noFKs("users")
 			},
 			expect: func(require *require.Assertions, t *schema.Table, err error) {
@@ -122,6 +135,7 @@ func TestDriver_InspectTable(t *testing.T) {
 				columns := []*schema.Column{
 					{Name: "c1", Type: &schema.ColumnType{Null: true, Type: &schema.IntegerType{T: "int"}, Raw: "int"}},
 					{Name: "c2", Type: &schema.ColumnType{Type: &schema.IntegerType{T: "integer"}, Raw: "integer"}},
+					{Name: "c3", Type: &schema.ColumnType{Type: &schema.JSONType{T: "json"}, Raw: "json"}},
 				}
 				indexes := []*schema.Index{
 					{
@@ -158,6 +172,18 @@ func TestDriver_InspectTable(t *testing.T) {
 						},
 						Attrs: []schema.Attr{
 							&CreateStmt{S: "CREATE INDEX c1_x ON users (f(c1))"},
+							&IndexOrigin{O: "c"},
+						},
+					},
+					{
+						Name:  "c3_x",
+						Table: t,
+						Parts: []*schema.IndexPart{
+							{SeqNo: 1, X: &schema.RawExpr{X: "json_extract(c3, '$.x')"}, Desc: true},
+							{SeqNo: 2, X: &schema.RawExpr{X: "json_extract(c3, '$.y')"}, Desc: true},
+						},
+						Attrs: []schema.Attr{
+							&CreateStmt{S: "CREATE INDEX c3_x ON users (json_extract(c3, '$.x') desc, json_extract(c3, '$.y') desc)"},
 							&IndexOrigin{O: "c"},
 						},
 					},
@@ -221,6 +247,37 @@ CREATE TABLE users(
 				require.Equal(t.Attrs[1:], checks)
 			},
 		},
+		{
+			name: "table options",
+			before: func(m mock) {
+				m.ExpectQuery(sqltest.Escape(fmt.Sprintf(databasesQueryArgs, "?"))).
+					WithArgs("main").
+					WillReturnRows(sqltest.Rows(`
+ name |   file
+------+-----------
+ main |
+`))
+				rows := sqlmock.NewRows([]string{"name", "sql", "wr", "strict"})
+				rows.AddRow("users", "CREATE TABLE users(id INTEGER PRIMARY KEY) without rowid, strict", 1, 1)
+				m.ExpectQuery(sqltest.Escape(tablesQuery + " AND sqlite_master.name IN (?)")).
+					WithArgs("users").
+					WillReturnRows(rows)
+				m.ExpectQuery(sqltest.Escape(fmt.Sprintf(columnsQuery, "users"))).
+					WillReturnRows(sqltest.Rows(`
+ name |   type       | nullable | dflt_value  | primary  | hidden
+------+--------------+----------+ ------------+----------+----------
+ id   | int          |  0       |             |  1       |  0
+`))
+				m.noIndexes("users")
+				m.noFKs("users")
+			},
+			expect: func(require *require.Assertions, t *schema.Table, err error) {
+				require.NoError(err)
+				require.Len(t.Attrs, 3)
+				require.Equal(t.Attrs[1], &WithoutRowID{})
+				require.Equal(t.Attrs[2], &Strict{})
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -233,6 +290,7 @@ CREATE TABLE users(
 			tt.before(mk)
 			s, err := drv.InspectSchema(context.Background(), "", &schema.InspectOptions{
 				Tables: []string{"users"},
+				Mode:   ^schema.InspectViews,
 			})
 			require.NoError(t, err)
 			tt.expect(require.New(t), s.Tables[0], err)
@@ -425,6 +483,7 @@ func TestRegex_Checks(t *testing.T) {
 		require.NoError(t, err)
 		s, err := drv.InspectSchema(context.Background(), "", &schema.InspectOptions{
 			Tables: []string{name},
+			Mode:   ^schema.InspectViews,
 		})
 		require.NoError(t, err)
 		table := s.Tables[0]
@@ -490,6 +549,7 @@ func TestRegex_GeneratedExpr(t *testing.T) {
 		require.NoError(t, err)
 		s, err := drv.InspectSchema(context.Background(), "", &schema.InspectOptions{
 			Tables: []string{name},
+			Mode:   ^schema.InspectViews,
 		})
 		require.NoError(t, err)
 		require.Equal(t, tt.column.Attrs, s.Tables[0].Columns[0].Attrs)
@@ -507,16 +567,6 @@ func (m mock) systemVars(version string) {
 ----------------
  ` + version + `
 `))
-	m.ExpectQuery(sqltest.Escape("SELECT name FROM pragma_collation_list()")).
-		WillReturnRows(sqltest.Rows(`
-  pragma_collation_list   
-------------------------
-      decimal
-      uint
-      RTRIM
-      NOCASE
-      BINARY
-`))
 }
 
 func (m mock) tableExists(table string, exists bool, stmt ...string) {
@@ -527,11 +577,11 @@ func (m mock) tableExists(table string, exists bool, stmt ...string) {
 ------+-----------
  main |   
 `))
-	rows := sqlmock.NewRows([]string{"name", "sql"})
+	rows := sqlmock.NewRows([]string{"name", "sql", "wr", "strict"})
 	if exists {
-		rows.AddRow(table, stmt[0])
+		rows.AddRow(table, stmt[0], nil, nil)
 	}
-	m.ExpectQuery(sqltest.Escape(tablesQuery + " AND name IN (?)")).
+	m.ExpectQuery(sqltest.Escape(tablesQuery + " AND sqlite_master.name IN (?)")).
 		WithArgs(table).
 		WillReturnRows(rows)
 }

@@ -14,12 +14,6 @@ import (
 	"ariga.io/atlas/sql/mysql"
 	"ariga.io/atlas/sql/schema"
 
-	"entgo.io/ent/dialect"
-	entsql "entgo.io/ent/dialect/sql"
-	entschema "entgo.io/ent/dialect/sql/schema"
-	"entgo.io/ent/entc/integration/ent"
-	"entgo.io/ent/entc/integration/ent/migrate"
-
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
@@ -467,7 +461,9 @@ schema "second" {
 }
 `
 		t.applyRealmHcl(wa)
-		realm, err = t.drv.InspectRealm(context.Background(), &schema.InspectRealmOption{})
+		realm, err = t.drv.InspectRealm(context.Background(), &schema.InspectRealmOption{
+			Mode: schema.InspectSchemas | schema.InspectTables,
+		})
 		require.NoError(t, err)
 		_, ok := realm.Schema("test")
 		require.True(t, ok)
@@ -657,45 +653,6 @@ schema "test" {
 	})
 }
 
-func TestTiDB_Ent_EntEngine(t *testing.T) {
-	tidbRun(t, func(t *myTest) {
-		testEntIntegration(t, dialect.MySQL, t.db, migrate.WithForeignKeys(false))
-	})
-}
-
-func TestTiDB_Ent_AtlasEngine(t *testing.T) {
-	tidbRun(t, func(t *myTest) {
-		ctx := context.Background()
-		drv := entsql.OpenDB(dialect.MySQL, t.db)
-		client := ent.NewClient(ent.Driver(drv))
-		require.NoError(t, client.Schema.Create(ctx, entschema.WithAtlas(true)))
-		sanity(client)
-		realm := t.loadRealm()
-		ensureNoChange(t, realm.Schemas[0].Tables...)
-
-		// Drop tables.
-		changes := make([]schema.Change, len(realm.Schemas[0].Tables))
-		for i, t := range realm.Schemas[0].Tables {
-			changes[i] = &schema.DropTable{T: t}
-		}
-		t.migrate(changes...)
-
-		// Add tables.
-		for i, t := range realm.Schemas[0].Tables {
-			changes[i] = &schema.AddTable{T: t}
-		}
-		t.migrate(changes...)
-		ensureNoChange(t, realm.Schemas[0].Tables...)
-		sanity(client)
-
-		// Drop tables.
-		for i, t := range realm.Schemas[0].Tables {
-			changes[i] = &schema.DropTable{T: t}
-		}
-		t.migrate(changes...)
-	})
-}
-
 func TestTiDB_Sanity(t *testing.T) {
 	n := "atlas_types_sanity"
 	t.Run("Common", func(t *testing.T) {
@@ -749,9 +706,8 @@ create table atlas_types_sanity
 				Name: n,
 				Attrs: []schema.Attr{
 					&schema.Charset{V: "latin1"},
-					&schema.Collation{
-						V: "latin1_bin",
-					},
+					&schema.Collation{V: "latin1_bin"},
+					&mysql.Engine{V: "InnoDB", Default: true},
 				},
 				Schema: realm.Schemas[0],
 				Columns: []*schema.Column{
@@ -1016,6 +972,7 @@ create table atlas_types_sanity
 					return []schema.Attr{
 						&schema.Charset{V: "latin1"},
 						&schema.Collation{V: "latin1_bin"},
+						&mysql.Engine{V: "InnoDB", Default: true},
 					}
 				}(),
 				Schema: realm.Schemas[0],
@@ -1053,6 +1010,7 @@ create table atlas_types_sanity
 					return []schema.Attr{
 						&schema.Collation{V: "utf8mb4_bin"},
 						&schema.Charset{V: "utf8mb4"},
+						&mysql.Engine{V: "InnoDB", Default: true},
 					}
 				}(),
 				Columns: []*schema.Column{

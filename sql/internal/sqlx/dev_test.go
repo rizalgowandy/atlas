@@ -6,12 +6,12 @@ package sqlx
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"ariga.io/atlas/sql/migrate"
 	"ariga.io/atlas/sql/schema"
 
+	"github.com/hashicorp/hcl/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -21,22 +21,57 @@ func TestDriver_NormalizeRealm(t *testing.T) {
 			realm: schema.NewRealm(schema.New("test").SetCharset("utf8mb4")),
 		}
 		dev = &DevDriver{
-			Driver:     drv,
-			MaxNameLen: 64,
+			Driver: drv,
 		}
+		r = schema.NewRealm(schema.New("test"))
 	)
-	normal, err := dev.NormalizeRealm(context.Background(), schema.NewRealm(schema.New("test")))
+	normal, err := dev.NormalizeRealm(context.Background(), r)
 	require.NoError(t, err)
 	require.Equal(t, normal, drv.realm)
 
 	require.Len(t, drv.schemas, 1)
-	require.True(t, strings.HasPrefix(drv.schemas[0], "atlas_dev_test_"))
+	require.Len(t, drv.changes, 1, "expect 1 call for creating the schema")
+	require.Equal(t, &schema.AddSchema{
+		S: r.Schemas[0],
+		// The "IF NOT EXISTS" clause is added to make the
+		// operation noop for schema like "public" in Postgres.
+		Extra: []schema.Clause{&schema.IfNotExists{}},
+	}, drv.changes[0])
 
-	require.Len(t, drv.changes, 2, "expect 2 calls (create and drop)")
-	require.Len(t, drv.changes[0], 1)
-	require.Equal(t, &schema.AddSchema{S: schema.New(drv.schemas[0])}, drv.changes[0][0])
-	require.Len(t, drv.changes[1], 1)
-	require.Equal(t, &schema.DropSchema{S: schema.New(drv.schemas[0]), Extra: []schema.Clause{&schema.IfExists{}}}, drv.changes[1][0])
+	// Retain positions.
+	r.Schemas[0].
+		AddAttrs(
+			schema.NewFilePos("schema.hcl").
+				SetStart(hcl.Pos{Line: 1, Column: 1, Byte: 1}),
+		).
+		AddTables(
+			schema.NewTable("t1").
+				SetPos(
+					schema.NewFilePos("schema.hcl").
+						SetStart(hcl.Pos{Line: 2, Column: 2, Byte: 2}),
+				).
+				AddColumns(
+					schema.NewIntColumn("id", "int").
+						SetPos(
+							schema.NewFilePos("schema.hcl").
+								SetStart(hcl.Pos{Line: 3, Column: 3, Byte: 3}),
+						),
+				),
+		)
+	drv.realm.Schemas[0].AddTables(
+		schema.NewTable("t1").AddColumns(schema.NewIntColumn("id", "int")),
+	)
+	normal, err = dev.NormalizeRealm(context.Background(), r)
+	require.NoError(t, err)
+	p, ok := normal.Schemas[0].Pos()
+	require.True(t, ok)
+	require.Equal(t, schema.NewFilePos("schema.hcl").SetStart(hcl.Pos{Line: 1, Column: 1, Byte: 1}), p)
+	p, ok = normal.Schemas[0].Tables[0].Pos()
+	require.True(t, ok)
+	require.Equal(t, schema.NewFilePos("schema.hcl").SetStart(hcl.Pos{Line: 2, Column: 2, Byte: 2}), p)
+	p, ok = normal.Schemas[0].Tables[0].Columns[0].Pos()
+	require.True(t, ok)
+	require.Equal(t, schema.NewFilePos("schema.hcl").SetStart(hcl.Pos{Line: 3, Column: 3, Byte: 3}), p)
 }
 
 type mockDriver struct {
@@ -45,7 +80,7 @@ type mockDriver struct {
 	schemas []string
 	realm   *schema.Realm
 	// Apply.
-	changes [][]schema.Change
+	changes []schema.Change
 }
 
 func (m *mockDriver) InspectRealm(_ context.Context, opts *schema.InspectRealmOption) (*schema.Realm, error) {
@@ -54,6 +89,14 @@ func (m *mockDriver) InspectRealm(_ context.Context, opts *schema.InspectRealmOp
 }
 
 func (m *mockDriver) ApplyChanges(_ context.Context, changes []schema.Change, _ ...migrate.PlanOption) error {
-	m.changes = append(m.changes, changes)
+	m.changes = append(m.changes, changes...)
 	return nil
+}
+
+func (m *mockDriver) CheckClean(context.Context, *migrate.TableIdent) error {
+	return nil
+}
+
+func (m *mockDriver) Snapshot(context.Context) (migrate.RestoreFunc, error) {
+	return func(context.Context) error { return nil }, nil
 }

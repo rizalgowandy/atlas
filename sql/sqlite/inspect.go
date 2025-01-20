@@ -11,14 +11,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"ariga.io/atlas/sql/internal/sqlx"
 	"ariga.io/atlas/sql/schema"
 )
 
 // A diff provides an SQLite implementation for schema.Inspector.
-type inspect struct{ conn }
+type inspect struct{ *conn }
 
 var _ schema.Inspector = (*inspect)(nil)
 
@@ -34,24 +33,36 @@ func (i *inspect) InspectRealm(ctx context.Context, opts *schema.InspectRealmOpt
 	if opts == nil {
 		opts = &schema.InspectRealmOption{}
 	}
-	r := schema.NewRealm(schemas...)
-	if !sqlx.ModeInspectRealm(opts).Is(schema.InspectTables) {
-		return sqlx.ExcludeRealm(r, opts.Exclude)
-	}
-	for _, s := range schemas {
-		tables, err := i.tables(ctx, nil)
-		if err != nil {
-			return nil, err
-		}
-		s.AddTables(tables...)
-		for _, t := range tables {
-			if err := i.inspectTable(ctx, t); err != nil {
+	var (
+		r    = schema.NewRealm(schemas...)
+		mode = sqlx.ModeInspectRealm(opts)
+	)
+	if mode.Is(schema.InspectTables) {
+		for _, s := range schemas {
+			tables, err := i.tables(ctx, nil)
+			if err != nil {
 				return nil, err
 			}
+			s.AddTables(tables...)
+			for _, t := range tables {
+				if err := i.inspectTable(ctx, t); err != nil {
+					return nil, err
+				}
+			}
+		}
+		sqlx.LinkSchemaTables(r.Schemas)
+	}
+	if mode.Is(schema.InspectViews) {
+		if err := i.inspectViews(ctx, r, nil); err != nil {
+			return nil, err
 		}
 	}
-	sqlx.LinkSchemaTables(r.Schemas)
-	return sqlx.ExcludeRealm(r, opts.Exclude)
+	if mode.Is(schema.InspectTriggers) {
+		if err := i.inspectTriggers(ctx, r, nil); err != nil {
+			return nil, err
+		}
+	}
+	return schema.ExcludeRealm(r, opts.Exclude)
 }
 
 // InspectSchema returns schema descriptions of the tables in the given schema.
@@ -74,22 +85,34 @@ func (i *inspect) InspectSchema(ctx context.Context, name string, opts *schema.I
 	if opts == nil {
 		opts = &schema.InspectOptions{}
 	}
-	r := schema.NewRealm(schemas...)
-	if !sqlx.ModeInspectSchema(opts).Is(schema.InspectTables) {
-		return sqlx.ExcludeSchema(r.Schemas[0], opts.Exclude)
+	var (
+		r    = schema.NewRealm(schemas...)
+		mode = sqlx.ModeInspectSchema(opts)
+	)
+	if mode.Is(schema.InspectTables) {
+		tables, err := i.tables(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		r.Schemas[0].AddTables(tables...)
+		for _, t := range tables {
+			if err := i.inspectTable(ctx, t); err != nil {
+				return nil, err
+			}
+		}
+		sqlx.LinkSchemaTables(schemas)
 	}
-	tables, err := i.tables(ctx, opts)
-	if err != nil {
-		return nil, err
-	}
-	r.Schemas[0].AddTables(tables...)
-	for _, t := range tables {
-		if err := i.inspectTable(ctx, t); err != nil {
+	if mode.Is(schema.InspectViews) {
+		if err := i.inspectViews(ctx, r, opts); err != nil {
 			return nil, err
 		}
 	}
-	sqlx.LinkSchemaTables(schemas)
-	return sqlx.ExcludeSchema(r.Schemas[0], opts.Exclude)
+	if mode.Is(schema.InspectTriggers) {
+		if err := i.inspectTriggers(ctx, r, nil); err != nil {
+			return nil, err
+		}
+	}
+	return schema.ExcludeSchema(r.Schemas[0], opts.Exclude)
 }
 
 func (i *inspect) inspectTable(ctx context.Context, t *schema.Table) error {
@@ -102,10 +125,7 @@ func (i *inspect) inspectTable(ctx context.Context, t *schema.Table) error {
 	if err := i.fks(ctx, t); err != nil {
 		return err
 	}
-	if err := fillChecks(t); err != nil {
-		return err
-	}
-	return nil
+	return fillChecks(t)
 }
 
 // columns queries and appends the columns of the given table.
@@ -227,8 +247,11 @@ func (i *inspect) addIndexes(t *schema.Table, rows *sql.Rows) error {
 	return nil
 }
 
-// A regexp to extract index parts.
-var reIdxParts = regexp.MustCompile("(?i)ON\\s+[\"`]*(?:\\w+)[\"`]*\\s*\\((.+)\\)")
+var (
+	// A regexp to extract index parts.
+	reIdxParts = regexp.MustCompile("(?i)ON\\s+[\"`]*(?:\\w+)[\"`]*\\s*\\((.+?)\\)(\\s*WHERE\\s+.+)?$")
+	reIdxDesc  = regexp.MustCompile("(?i)\\s+DESC\\s*$")
+)
 
 func (i *inspect) indexInfo(ctx context.Context, t *schema.Table, idx *schema.Index) error {
 	var (
@@ -271,15 +294,23 @@ func (i *inspect) indexInfo(ctx context.Context, t *schema.Table, idx *schema.In
 	if !sqlx.Has(idx.Attrs, &c) || !reIdxParts.MatchString(c.S) {
 		return nil
 	}
-	parts := strings.Split(reIdxParts.FindStringSubmatch(c.S)[1], ",")
-	// Unable to parse index parts correctly.
-	if len(parts) != len(idx.Parts) {
-		return nil
-	}
-	for i, p := range idx.Parts {
-		if p.X != nil {
-			p.X.(*schema.RawExpr).X = strings.TrimSpace(parts[i])
+	x := reIdxParts.FindStringSubmatch(c.S)[1]
+	for _, p := range idx.Parts {
+		j := sqlx.ExprLastIndex(x)
+		// Unable to parse index parts correctly.
+		if j == -1 {
+			return nil
 		}
+		if p.X != nil {
+			// Remove any extra spaces and the "DESC" clause
+			// in case the key-part is descending.
+			kx := strings.TrimSpace(x[:j+1])
+			if p.Desc {
+				kx = reIdxDesc.ReplaceAllString(kx, "")
+			}
+			p.X.(*schema.RawExpr).X = kx
+		}
+		x = strings.TrimLeft(x[j+1:], ", ")
 	}
 	return nil
 }
@@ -355,7 +386,7 @@ func (i *inspect) tables(ctx context.Context, opts *schema.InspectOptions) ([]*s
 		query = tablesQuery
 	)
 	if opts != nil && len(opts.Tables) > 0 {
-		query += " AND name IN (" + strings.Repeat("?, ", len(opts.Tables)-1) + "?)"
+		query += " AND sqlite_master.name IN (" + strings.Repeat("?, ", len(opts.Tables)-1) + "?)"
 		for _, s := range opts.Tables {
 			args = append(args, s)
 		}
@@ -367,8 +398,11 @@ func (i *inspect) tables(ctx context.Context, opts *schema.InspectOptions) ([]*s
 	defer rows.Close()
 	var tables []*schema.Table
 	for rows.Next() {
-		var name, stmt string
-		if err := rows.Scan(&name, &stmt); err != nil {
+		var (
+			name, stmt string
+			wr, strict sql.NullBool
+		)
+		if err := rows.Scan(&name, &stmt, &wr, &strict); err != nil {
 			return nil, fmt.Errorf("sqlite: scanning table: %w", err)
 		}
 		stmt = strings.TrimSpace(stmt)
@@ -378,8 +412,11 @@ func (i *inspect) tables(ctx context.Context, opts *schema.InspectOptions) ([]*s
 				&CreateStmt{S: strings.TrimSpace(stmt)},
 			},
 		}
-		if strings.HasSuffix(stmt, "WITHOUT ROWID") || strings.HasSuffix(stmt, "without rowid") {
+		if wr.Bool {
 			t.Attrs = append(t.Attrs, &WithoutRowID{})
+		}
+		if strict.Bool {
+			t.Attrs = append(t.Attrs, &Strict{})
 		}
 		tables = append(tables, t)
 	}
@@ -454,6 +491,12 @@ type (
 		schema.Attr
 	}
 
+	// Strict describes the `STRICT` configuration.
+	// See: https://sqlite.org/stricttables.html
+	Strict struct {
+		schema.Attr
+	}
+
 	// IndexPredicate describes a partial index predicate.
 	// See: https://www.sqlite.org/partialindex.html
 	IndexPredicate struct {
@@ -469,7 +512,12 @@ type (
 	}
 
 	// A UUIDType defines a UUID type.
-	UUIDType struct {
+	//
+	// Deprecated: Use schema.UUIDType instead.
+	UUIDType = schema.UUIDType
+
+	// UserDefinedType defines a user-defined type attribute.
+	UserDefinedType struct {
 		schema.Type
 		T string
 	}
@@ -482,7 +530,7 @@ func columnParts(t string) []string {
 	})
 	for k := 0; k < 2; k++ {
 		// Join the type back if it was separated with space (e.g. 'varying character').
-		if len(parts) > 1 && !isNumber(parts[0]) && !isNumber(parts[1]) {
+		if len(parts) > 1 && !sqlx.IsUint(parts[0]) && !sqlx.IsUint(parts[1]) {
 			parts[1] = parts[0] + " " + parts[1]
 			parts = parts[1:]
 		}
@@ -501,16 +549,6 @@ func defaultExpr(x string) schema.Expr {
 		// as they are not parsable in most decoders.
 		return &schema.RawExpr{X: x}
 	}
-}
-
-// isNumber reports whether the string is a number (category N).
-func isNumber(s string) bool {
-	for _, r := range s {
-		if !unicode.IsNumber(r) {
-			return false
-		}
-	}
-	return true
 }
 
 // blob literals are hex strings preceded by 'x' (or 'X).
@@ -707,9 +745,19 @@ const (
 	databasesQuery     = "SELECT `name`, `file` FROM pragma_database_list() WHERE `name` <> 'temp'"
 	databasesQueryArgs = "SELECT `name`, `file` FROM pragma_database_list() WHERE `name` IN (%s)"
 	// Query to list database tables.
-	tablesQuery = "SELECT `name`, `sql` FROM sqlite_master WHERE `type` = 'table' AND `name` NOT LIKE 'sqlite_%'"
+	tablesQuery = `
+SELECT
+	sqlite_master.name, sqlite_master.sql, wr, strict
+FROM
+	sqlite_master
+	JOIN pragma_table_list(sqlite_master.name)
+WHERE
+	sqlite_master.type = 'table'
+	AND sqlite_master.name NOT LIKE 'sqlite_%'
+	AND sqlite_master.name NOT LIKE 'libsql_%'
+`
 	// Query to list table information.
-	columnsQuery = "SELECT `name`, `type`, (not `notnull`) AS `nullable`, `dflt_value`, (`pk` <> 0) AS `pk`, `hidden` FROM pragma_table_xinfo('%s') ORDER BY `pk`, `cid`"
+	columnsQuery = "SELECT `name`, `type`, (not `notnull`) AS `nullable`, `dflt_value`, (`pk` <> 0) AS `pk`, `hidden` FROM pragma_table_xinfo('%s') ORDER BY `cid`"
 	// Query to list table indexes.
 	indexesQuery = "SELECT `il`.`name`, `il`.`unique`, `il`.`origin`, `il`.`partial`, `m`.`sql` FROM pragma_index_list('%s') AS il JOIN sqlite_master AS m ON il.name = m.name"
 	// Query to list index columns.

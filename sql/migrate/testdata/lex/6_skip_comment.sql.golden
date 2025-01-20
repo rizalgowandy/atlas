@@ -15,3 +15,9 @@ CREATE TABLE t5(
     /* comment */
     -- comment
 ) ENGINE=InnoDB;
+-- end --
+SELECT * FROM (
+  SELECT * FROM t1 # comment
+);
+-- end --
+SELECT * FROM t2;

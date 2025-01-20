@@ -8,15 +8,15 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"ariga.io/atlas/sql/migrate"
 	"ariga.io/atlas/sql/mysql"
 	"ariga.io/atlas/sql/schema"
-	"entgo.io/ent/dialect"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
@@ -49,14 +49,11 @@ func myRun(t *testing.T, fn func(*myTest)) {
 					tt.version = version
 					tt.rrw = &rrw{}
 					tt.db, err = sql.Open("mysql", fmt.Sprintf("root:pass@tcp(localhost:%d)/test?parseTime=True", tt.port))
-					if err != nil {
-						log.Fatalln(err)
-					}
-					dbs = append(dbs, tt.db) // close connection after all tests have been run
+					require.NoError(t, err)
+					// Close connection after all tests have been run.
+					dbs = append(dbs, tt.db)
 					tt.drv, err = mysql.Open(tt.db)
-					if err != nil {
-						log.Fatalln(err)
-					}
+					require.NoError(t, err)
 				})
 				tt := &myTest{T: t, db: tt.db, drv: tt.drv, version: version, port: tt.port, rrw: tt.rrw}
 				fn(tt)
@@ -493,12 +490,6 @@ func TestMySQL_ForeignKey(t *testing.T) {
 	})
 }
 
-func TestMySQL_Ent(t *testing.T) {
-	myRun(t, func(t *myTest) {
-		testEntIntegration(t, dialect.MySQL, t.db)
-	})
-}
-
 func TestMySQL_AdvisoryLock(t *testing.T) {
 	myRun(t, func(t *myTest) {
 		testAdvisoryLock(t.T, t.drv.(schema.Locker))
@@ -559,9 +550,11 @@ func TestMySQL_Snapshot(t *testing.T) {
 		require.NoError(t, err)
 
 		_, err = drv.(migrate.Snapshoter).Snapshot(context.Background())
-		require.ErrorAs(t, err, &migrate.NotCleanError{})
+		require.ErrorAs(t, err, new(*migrate.NotCleanError))
 
-		r, err := t.driver().InspectRealm(context.Background(), nil)
+		r, err := t.driver().InspectRealm(context.Background(), &schema.InspectRealmOption{
+			Mode: schema.InspectSchemas | schema.InspectTables,
+		})
 		require.NoError(t, err)
 		restore, err := t.driver().(migrate.Snapshoter).Snapshot(context.Background())
 		require.NoError(t, err) // connected to test schema
@@ -573,7 +566,9 @@ func TestMySQL_Snapshot(t *testing.T) {
 			t.dropTables("my_table")
 		})
 		require.NoError(t, restore(context.Background()))
-		r1, err := t.driver().InspectRealm(context.Background(), nil)
+		r1, err := t.driver().InspectRealm(context.Background(), &schema.InspectRealmOption{
+			Mode: schema.InspectSchemas | schema.InspectTables,
+		})
 		require.NoError(t, err)
 		diff, err := t.driver().RealmDiff(r1, r)
 		require.NoError(t, err)
@@ -584,6 +579,41 @@ func TestMySQL_Snapshot(t *testing.T) {
 func TestMySQL_CLI_MigrateApplyBC(t *testing.T) {
 	myRun(t, func(t *myTest) {
 		testCLIMigrateApplyBC(t, "mysql")
+	})
+}
+
+func TestMySQL_CLI_MigrateApplyLock(t *testing.T) {
+	myRun(t, func(t *myTest) {
+		t.dropSchemas("mysqlock")
+		t.migrate(&schema.AddSchema{S: schema.New("mysqlock")})
+		var (
+			b  atomic.Bool
+			wg sync.WaitGroup
+		)
+		for i := 0; i < 5; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				out, err := exec.Command(
+					execPath(t),
+					"migrate", "apply",
+					"--dir", "file://testdata/migrations/mysqlock",
+					"--url", t.url("mysqlock"),
+				).CombinedOutput()
+				require.NoError(t, err, string(out))
+				switch {
+				// Nop.
+				case err == nil && strings.HasPrefix(string(out), "No migration files to execute"):
+				// Successful run.
+				case err == nil && strings.HasPrefix(string(out), "Migrating to version 3"):
+					if b.Swap(true) {
+						t.Errorf("migration ran twice: %s", out)
+					}
+				}
+			}(i)
+		}
+		wg.Wait()
+		require.True(t, b.Load(), "Migration should run successfully exactly once")
 	})
 }
 
@@ -667,26 +697,26 @@ func TestMySQL_CLI_MultiSchema(t *testing.T) {
 				charset   = "%s"
 				collation = "%s"
 			}
-			table "users" {
+			table "test" "users" {
 				schema = schema.test
 				column "id" {
 					type = int
 				}
 				primary_key {
-					columns = [table.users.column.id]
+					columns = [column.id]
 				}
 			}
 			schema "test2" {
 				charset   = "%s"
 				collation = "%s"
 			}
-			table "users" {
+			table "test2" "users" {
 				schema = schema.test2
 				column "id" {
 					type = int
 				}
 				primary_key {
-					columns = [table.users.column.id]
+					columns = [column.id]
 				}
 			}`
 	t.Run("SchemaInspect", func(t *testing.T) {
@@ -720,7 +750,9 @@ schema "second" {
 }
 `
 		t.applyRealmHcl(wa)
-		realm, err = t.drv.InspectRealm(context.Background(), &schema.InspectRealmOption{})
+		realm, err = t.drv.InspectRealm(context.Background(), &schema.InspectRealmOption{
+			Mode: schema.InspectSchemas | schema.InspectTables,
+		})
 		require.NoError(t, err)
 		_, ok := realm.Schema("test")
 		require.True(t, ok)
@@ -789,7 +821,10 @@ schema "users" {
 		hcl, err := mysql.MarshalHCL(realm)
 		require.NoError(t, err)
 		t.applyRealmHcl(string(hcl) + "\n" + expected)
-		realm, err = t.drv.InspectRealm(context.Background(), &schema.InspectRealmOption{Schemas: []string{"users", "financial"}})
+		realm, err = t.drv.InspectRealm(context.Background(), &schema.InspectRealmOption{
+			Mode:    schema.InspectSchemas | schema.InspectTables,
+			Schemas: []string{"users", "financial"},
+		})
 		require.NoError(t, err)
 		actual, err := mysql.MarshalHCL(realm)
 		require.NoError(t, err)
@@ -887,6 +922,7 @@ create table atlas_types_sanity
 				Attrs: []schema.Attr{
 					&schema.Charset{V: "latin1"},
 					&schema.Collation{V: "latin1_swedish_ci"},
+					&mysql.Engine{V: "InnoDB", Default: true},
 				},
 				Schema: realm.Schemas[0],
 				Columns: []*schema.Column{
@@ -1232,19 +1268,11 @@ create table atlas_types_sanity
 			require.True(t, ok)
 			expected := schema.Table{
 				Name: n,
-				Attrs: func() []schema.Attr {
-					if t.version == "maria107" {
-						return []schema.Attr{
-							&schema.Charset{V: "latin1"},
-							&schema.Collation{V: "latin1_swedish_ci"},
-							&schema.Check{Name: "tJSON", Expr: "json_valid(`tJSON`)"},
-						}
-					}
-					return []schema.Attr{
-						&schema.Charset{V: "latin1"},
-						&schema.Collation{V: "latin1_swedish_ci"},
-					}
-				}(),
+				Attrs: []schema.Attr{
+					&schema.Charset{V: "latin1"},
+					&schema.Collation{V: "latin1_swedish_ci"},
+					&mysql.Engine{V: "InnoDB", Default: true},
+				},
 				Schema: realm.Schemas[0],
 				Columns: []*schema.Column{
 					func() *schema.Column {
@@ -1449,6 +1477,7 @@ func (t *myTest) quoted(s string) string {
 func (t *myTest) loadRealm() *schema.Realm {
 	r, err := t.drv.InspectRealm(context.Background(), &schema.InspectRealmOption{
 		Schemas: []string{"test"},
+		Mode:    schema.InspectSchemas | schema.InspectTables,
 	})
 	require.NoError(t, err)
 	return r

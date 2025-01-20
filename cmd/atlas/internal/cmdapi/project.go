@@ -6,44 +6,29 @@ package cmdapi
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
 
+	"ariga.io/atlas/cmd/atlas/internal/cloudapi"
+	"ariga.io/atlas/cmd/atlas/internal/cmdext"
+	cmdmigrate "ariga.io/atlas/cmd/atlas/internal/migrate"
 	"ariga.io/atlas/schemahcl"
-	"ariga.io/atlas/sql/sqlclient"
+	"ariga.io/atlas/sql/schema"
 
 	"github.com/hashicorp/hcl/v2"
-	"github.com/hashicorp/hcl/v2/gohcl"
+	"github.com/hashicorp/hcl/v2/hclparse"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/spf13/cobra"
 	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/function"
 )
 
-const projectFileName = "file://atlas.hcl"
-
-type loadConfig struct {
-	inputVals map[string]cty.Value
-}
-
-// LoadOption configures the LoadEnv function.
-type LoadOption func(*loadConfig)
-
-// WithInput is a LoadOption that sets the input values for the LoadEnv function.
-func WithInput(vals map[string]cty.Value) LoadOption {
-	return func(config *loadConfig) {
-		config.inputVals = vals
-	}
-}
-
 type (
-	// Project represents an atlas.hcl project file.
-	Project struct {
-		Envs []*Env `spec:"env"`  // List of environments
-		Lint *Lint  `spec:"lint"` // Optional global lint config
-	}
-
 	// Env represents an Atlas environment.
 	Env struct {
 		// Name for this environment.
@@ -63,29 +48,59 @@ type (
 		// resources on inspection.
 		Exclude []string `spec:"exclude"`
 
+		// Schema containing the schema configuration of the env.
+		Schema *Schema `spec:"schema"`
+
 		// Migration containing the migration configuration of the env.
 		Migration *Migration `spec:"migration"`
 
-		// Lint of the environment.
+		// Diff policy of the environment.
+		Diff *Diff `spec:"diff"`
+
+		// Lint policy of the environment.
 		Lint *Lint `spec:"lint"`
 
-		// Log of the environment.
-		Log Log `spec:"log"`
+		// Format of the environment.
+		Format Format `spec:"format"`
+
+		// Test configuration of the environment.
+		Test *Test `spec:"test"`
+
 		schemahcl.DefaultExtension
+		cloud  *cmdext.AtlasConfig
+		config *Project
 	}
 
 	// Migration represents the migration directory for the Env.
 	Migration struct {
-		Dir             string `spec:"dir"`
-		Format          string `spec:"format"`
-		Baseline        string `spec:"baseline"`
-		RevisionsSchema string `spec:"revisions_schema"`
+		Dir             string   `spec:"dir"`
+		Exclude         []string `spec:"exclude"`
+		Format          string   `spec:"format"`
+		Baseline        string   `spec:"baseline"`
+		ExecOrder       string   `spec:"exec_order"`
+		LockTimeout     string   `spec:"lock_timeout"`
+		RevisionsSchema string   `spec:"revisions_schema"`
+		Repo            *Repo    `spec:"repo"`
+	}
+
+	// Schema represents a schema in the registry.
+	Schema struct {
+		// The extension holds the "src" attribute.
+		// It can be a string, or a list of strings.
+		schemahcl.DefaultExtension
+		Repo *Repo `spec:"repo"`
+	}
+
+	// Repo represents a repository in the schema registry
+	// for a schema or migrations directory.
+	Repo struct {
+		Name string `spec:"name"` // Name of the repository.
 	}
 
 	// Lint represents the configuration of migration linting.
 	Lint struct {
-		// Log configures the --log option.
-		Log string `spec:"log"`
+		// Format configures the --format option.
+		Format string `spec:"log"`
 		// Latest configures the --latest option.
 		Latest int `spec:"latest"`
 		Git    struct {
@@ -94,22 +109,209 @@ type (
 			// Base configures the --git-base option.
 			Base string `spec:"base"`
 		} `spec:"git"`
+		// Review defines when Atlas will ask the user to review and approve the changes.
+		Review string `spec:"review"`
 		schemahcl.DefaultExtension
 	}
 
-	// Log represents a logging configuration of an environment.
-	Log struct {
+	// Diff represents the schema diffing policy.
+	Diff struct {
+		// SkipChanges configures the skip changes policy.
+		SkipChanges *SkipChanges `spec:"skip"`
+		schemahcl.DefaultExtension
+	}
+
+	// Test represents the test configuration of a project or environment.
+	Test struct {
+		// Schema represents the 'schema test' configuration.
+		Schema struct {
+			Src  []string `spec:"src"`
+			Vars Vars     `spec:"vars"`
+		} `spec:"schema"`
+		// Migrate represents the 'migrate test' configuration.
 		Migrate struct {
-			// Apply configures the logging for 'migrate apply'.
-			Apply string `spec:"apply"`
-			// Lint configures the logging for 'migrate lint'.
-			Lint string `spec:"lint"`
-			// Status configures the logging for 'migrate status'.
-			Status string `spec:"status"`
+			Src  []string `spec:"src"`
+			Vars Vars     `spec:"vars"`
 		} `spec:"migrate"`
+	}
+
+	// SkipChanges represents the skip changes policy.
+	SkipChanges struct {
+		AddSchema        bool `spec:"add_schema"`
+		DropSchema       bool `spec:"drop_schema"`
+		ModifySchema     bool `spec:"modify_schema"`
+		AddTable         bool `spec:"add_table"`
+		DropTable        bool `spec:"drop_table"`
+		ModifyTable      bool `spec:"modify_table"`
+		RenameTable      bool `spec:"rename_table"`
+		AddColumn        bool `spec:"add_column"`
+		DropColumn       bool `spec:"drop_column"`
+		ModifyColumn     bool `spec:"modify_column"`
+		AddIndex         bool `spec:"add_index"`
+		DropIndex        bool `spec:"drop_index"`
+		ModifyIndex      bool `spec:"modify_index"`
+		AddForeignKey    bool `spec:"add_foreign_key"`
+		DropForeignKey   bool `spec:"drop_foreign_key"`
+		ModifyForeignKey bool `spec:"modify_foreign_key"`
+		AddView          bool `spec:"add_view"`
+		DropView         bool `spec:"drop_view"`
+		ModifyView       bool `spec:"modify_view"`
+		RenameView       bool `spec:"rename_view"`
+		AddFunc          bool `spec:"add_func"`
+		DropFunc         bool `spec:"drop_func"`
+		ModifyFunc       bool `spec:"modify_func"`
+		RenameFunc       bool `spec:"rename_func"`
+		AddProc          bool `spec:"add_proc"`
+		DropProc         bool `spec:"drop_proc"`
+		ModifyProc       bool `spec:"modify_proc"`
+		RenameProc       bool `spec:"rename_proc"`
+		AddTrigger       bool `spec:"add_trigger"`
+		DropTrigger      bool `spec:"drop_trigger"`
+		ModifyTrigger    bool `spec:"modify_trigger"`
+		RenameTrigger    bool `spec:"rename_trigger"`
+	}
+
+	// Format represents the output formatting configuration of an environment.
+	Format struct {
+		Migrate struct {
+			// Apply configures the formatting for 'migrate apply'.
+			Apply string `spec:"apply"`
+			// Down configures the formatting for 'migrate down'.
+			Down string `spec:"down"`
+			// Lint configures the formatting for 'migrate lint'.
+			Lint string `spec:"lint"`
+			// Status configures the formatting for 'migrate status'.
+			Status string `spec:"status"`
+			// Apply configures the formatting for 'migrate diff'.
+			Diff string `spec:"diff"`
+		} `spec:"migrate"`
+		Schema struct {
+			// Clean configures the formatting for 'schema clean'.
+			Clean string `spec:"clean"`
+			// Inspect configures the formatting for 'schema inspect'.
+			Inspect string `spec:"inspect"`
+			// Apply configures the formatting for 'schema apply'.
+			Apply string `spec:"apply"`
+			// Apply configures the formatting for 'schema diff'.
+			Diff string `spec:"diff"`
+			// Push configures the formatting for 'schema push'.
+			Push string `spec:"push"`
+		} `spec:"schema"`
 		schemahcl.DefaultExtension
 	}
 )
+
+// envScheme defines the scheme that can be used to reference env attributes.
+const envAttrScheme = "env"
+
+// MigrationRepo returns the migration repository name, if set.
+func (e *Env) MigrationRepo() (s string) {
+	if e != nil && e.Migration != nil && e.Migration.Repo != nil {
+		s = e.Migration.Repo.Name
+	}
+	return
+}
+
+// MigrationExclude returns the exclusion patterns of the migration directory.
+func (e *Env) MigrationExclude() []string {
+	if e != nil && e.Migration != nil {
+		return e.Migration.Exclude
+	}
+	return nil
+}
+
+// SchemaRepo returns the desired schema repository name, if set.
+func (e *Env) SchemaRepo() (s string) {
+	if e != nil && e.Schema != nil && e.Schema.Repo != nil {
+		s = e.Schema.Repo.Name
+	}
+	return
+}
+
+// LintReview returns the review mode for the lint command.
+func (e *Env) LintReview() string {
+	if e != nil && e.Lint != nil && e.Lint.Review != "" {
+		return e.Lint.Review
+	}
+	return ReviewAlways
+}
+
+// VarFromURL returns the string variable (env attribute) from the URL.
+func (e *Env) VarFromURL(s string) (string, error) {
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", err
+	}
+	if u.Host == "" || u.Path != "" || u.RawQuery != "" {
+		return "", fmt.Errorf("invalid env:// variable %q", s)
+	}
+	var sv string
+	switch u.Host {
+	case "url":
+		sv = e.URL
+	case "dev":
+		sv = e.DevURL
+	case "src", "schema.src":
+		var (
+			ok   bool
+			attr *schemahcl.Attr
+		)
+		switch {
+		case u.Host == "src":
+			attr, ok = e.Attr("src")
+		case e.Schema != nil:
+			attr, ok = e.Schema.Attr("src")
+		}
+		if !ok {
+			return "", fmt.Errorf("env://%s: no src attribute defined in env %q", u.Host, e.Name)
+		}
+		switch attr.V.Type() {
+		case cty.String:
+			s, err := attr.String()
+			if err != nil {
+				return "", fmt.Errorf("env://%s: %w", u.Host, err)
+			}
+			return s, nil
+		case cty.List(cty.String):
+			vs, err := attr.Strings()
+			if err != nil {
+				return "", fmt.Errorf("env://%s: %w", u.Host, err)
+			}
+			if len(vs) != 0 {
+				return "", fmt.Errorf("env://%s: expect one schema in env %q, got %d", u.Host, e.Name, len(vs))
+			}
+			return vs[0], nil
+		default:
+			return "", fmt.Errorf("env://%s: src attribute must be a string or list of strings, got %s", u.Host, attr.V.Type().FriendlyName())
+		}
+	case "migration.dir":
+		if e.Migration == nil || e.Migration.Dir == "" {
+			return "", fmt.Errorf("env://%s: no migration dir defined in env %q", u.Host, e.Name)
+		}
+		sv = e.Migration.Dir
+	default:
+		attr, ok := e.Attr(u.Host)
+		if !ok {
+			return "", fmt.Errorf("env://%s (attribute) not found in env.%s", u.Host, e.Name)
+		}
+		if sv, err = attr.String(); err != nil {
+			return "", fmt.Errorf("env://%s: %w", u.Host, err)
+		}
+	}
+	if strings.HasPrefix(sv, envAttrScheme+"://") {
+		return "", fmt.Errorf("env://%s (attribute) cannot reference another env://", s)
+	}
+	return sv, nil
+}
+
+// support backward compatibility with the 'log' attribute.
+func (e *Env) remainedLog() error {
+	r, ok := e.Remain().Resource("log")
+	if ok {
+		return r.As(&e.Format)
+	}
+	return nil
+}
 
 // Extend allows extending environment blocks with
 // a global one. For example:
@@ -140,10 +342,15 @@ func (l *Lint) Extend(global *Lint) *Lint {
 	if l == nil {
 		return global
 	}
-	if l.Log == "" {
-		l.Log = global.Log
+	if l.Review == "" {
+		l.Review = global.Review
 	}
-	l.Extra = global.Extra
+	if l.Format == "" {
+		l.Format = global.Format
+	}
+	if len(l.Extra.Children) == 0 && len(l.Extra.Attrs) == 0 {
+		l.Extra = global.Extra
+	}
 	switch {
 	// Changes detector was configured on the env.
 	case l.Git.Dir != "" && l.Git.Base != "" || l.Latest != 0:
@@ -162,187 +369,379 @@ func (l *Lint) Extend(global *Lint) *Lint {
 	return l
 }
 
-// Sources returns the paths containing the Atlas schema.
-func (e *Env) Sources() ([]string, error) {
-	attr, exists := e.Attr("src")
-	if !exists {
-		return nil, nil
+// support backward compatibility with the 'log' attribute.
+func (l *Lint) remainedLog() error {
+	at, ok := l.Remain().Attr("log")
+	if !ok {
+		return nil
 	}
-	if s, err := attr.String(); err == nil {
-		return []string{s}, nil
+	if l.Format != "" {
+		return fmt.Errorf("cannot use both 'log' and 'format' in the same lint block")
 	}
-	if s, err := attr.Strings(); err == nil {
-		return s, nil
+	s, err := at.String()
+	if err != nil {
+		return err
 	}
-	return nil, errors.New("expected src to be either a string or a string array")
+	l.Format = s
+	return nil
 }
 
-// asMap returns the extra attributes stored in the Env as a map[string]string.
-func (e *Env) asMap() (map[string]string, error) {
-	m := make(map[string]string, len(e.Extra.Attrs))
+// Extend allows extending environment blocks with
+// a global one. For example:
+//
+//	diff {
+//	  skip {
+//	    drop_schema = true
+//	  }
+//	}
+//
+//	env "local" {
+//	  ...
+//	  diff {
+//	    concurrent_index {
+//	      create = true
+//	      drop = true
+//	    }
+//	  }
+//	}
+func (d *Diff) Extend(global *Diff) *Diff {
+	if d == nil {
+		return global
+	}
+	if d.SkipChanges == nil {
+		d.SkipChanges = global.SkipChanges
+	}
+	return d
+}
+
+// Options converts the diff policy into options.
+func (d *Diff) Options() (opts []schema.DiffOption) {
+	// Per-driver configuration.
+	opts = append(opts, func(opts *schema.DiffOptions) {
+		opts.Extra = d.DefaultExtension
+	})
+	if d.SkipChanges == nil {
+		return
+	}
+	var (
+		changes schema.Changes
+		rv      = reflect.ValueOf(d.SkipChanges).Elem()
+	)
+	for _, c := range []schema.Change{
+		&schema.AddSchema{}, &schema.DropSchema{}, &schema.ModifySchema{},
+		&schema.AddView{}, &schema.DropView{}, &schema.ModifyView{}, &schema.RenameView{},
+		&schema.AddFunc{}, &schema.DropFunc{}, &schema.ModifyFunc{}, &schema.RenameFunc{},
+		&schema.AddProc{}, &schema.DropProc{}, &schema.ModifyProc{}, &schema.RenameProc{},
+		&schema.AddTrigger{}, &schema.DropTrigger{}, &schema.ModifyTrigger{}, &schema.RenameTrigger{},
+		&schema.AddTable{}, &schema.DropTable{}, &schema.ModifyTable{}, &schema.RenameTable{},
+		&schema.AddColumn{}, &schema.DropColumn{}, &schema.ModifyColumn{}, &schema.AddIndex{},
+		&schema.DropIndex{}, &schema.ModifyIndex{}, &schema.AddForeignKey{}, &schema.DropForeignKey{},
+		&schema.ModifyForeignKey{},
+	} {
+		if rt := reflect.TypeOf(c).Elem(); rv.FieldByName(rt.Name()).Bool() {
+			changes = append(changes, c)
+		}
+	}
+	if len(changes) > 0 {
+		opts = append(opts, schema.DiffSkipChanges(changes...))
+	}
+	return opts
+}
+
+// DiffOptions returns the diff options configured for the environment,
+// or nil if no environment or diff policy were set.
+func (e *Env) DiffOptions() []schema.DiffOption {
+	if e == nil || e.Diff == nil {
+		return nil
+	}
+	return e.Diff.Options()
+}
+
+// Sources returns the paths containing the Atlas desired schema.
+// The "src" attribute predates the "schema" block. If the "schema"
+// is defined, it takes precedence over the "src" attribute.
+func (e *Env) Sources() ([]string, error) {
+	var (
+		ok   bool
+		attr *schemahcl.Attr
+	)
+	if attr, ok = e.Attr("src"); !ok && e.Schema != nil {
+		attr, ok = e.Schema.Attr("src")
+	}
+	if !ok {
+		return nil, nil
+	}
+	switch attr.V.Type() {
+	case cty.String:
+		s, err := attr.String()
+		if err != nil {
+			return nil, err
+		}
+		return []string{s}, nil
+	case cty.List(cty.String):
+		return attr.Strings()
+	default:
+		return nil, fmt.Errorf("expected src to be either a string or strings, got: %s", attr.V.Type().FriendlyName())
+	}
+}
+
+// Vars returns the extra attributes stored in the Env as a map[string]cty.Value.
+func (e *Env) Vars() map[string]cty.Value {
+	m := make(map[string]cty.Value, len(e.Extra.Attrs))
 	for _, attr := range e.Extra.Attrs {
 		if attr.K == "src" {
 			continue
 		}
-		if v, err := attr.String(); err == nil {
-			m[attr.K] = v
-			continue
-		}
-		return nil, fmt.Errorf("expecting attr %q to be a literal, got: %T", attr.K, attr.V)
+		m[attr.K] = attr.V
 	}
-	return m, nil
+	// For backward compatibility, we append the GlobalFlags as variables.
+	for k, v := range GlobalFlags.Vars {
+		if _, ok := m[k]; !ok {
+			m[k] = v
+		}
+	}
+	return m
 }
 
-var hclState = schemahcl.New(
-	schemahcl.WithScopedEnums("env.migration.format", formatAtlas, formatFlyway, formatLiquibase, formatGoose, formatGolangMigrate),
-	schemahcl.WithDataSource("sql", func(ctx *hcl.EvalContext, b *hclsyntax.Block) (cty.Value, error) {
-		return (&sqlsrc{ctx: ctx, block: b}).exec()
-	}),
-)
+// Extend allows extending environment blocks with
+// a global one. For example:
+//
+//	test {
+//	  schema {
+//	    src = [...]
+//	  }
+//	}
+//
+//	env "local" {
+//	  ...
+//	  test {
+//	    schema {
+//	      src = [...]
+//	    }
+//	  }
+//	}
+func (t *Test) Extend(global *Test) *Test {
+	if t == nil {
+		return global
+	}
+	return t
+}
 
-// LoadEnv reads the project file in path, and loads
-// the environment instances with the provided name.
-func LoadEnv(name string, opts ...LoadOption) ([]*Env, error) {
-	cfg := &loadConfig{}
-	for _, f := range opts {
-		f(cfg)
+// EnvByName parses and returns the project configuration with selected environments.
+func EnvByName(cmd *cobra.Command, name string, vars map[string]cty.Value) (*Project, []*Env, error) {
+	envs := make(map[string][]*Env)
+	defer func() {
+		setEnvs(cmd.Context(), envs[name])
+	}()
+	if p, e, ok := envsCache.load(GlobalFlags.ConfigURL, name, vars); ok {
+		return p, e, maySetLoginContext(cmd, p)
 	}
 	u, err := url.Parse(GlobalFlags.ConfigURL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if u.Scheme != "file" {
-		return nil, fmt.Errorf("unsupported project file driver %q", u.Scheme)
+		return nil, nil, fmt.Errorf("unsupported config file driver %q", u.Scheme)
 	}
 	path := filepath.Join(u.Host, u.Path)
-	b, err := os.ReadFile(path)
-	if err != nil {
+	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
-			err = fmt.Errorf("project file %q was not found: %w", path, err)
+			err = fmt.Errorf("config file %q was not found: %w", path, err)
 		}
-		return nil, err
+		return nil, nil, err
 	}
-	project := &Project{Lint: &Lint{}}
-	if err := hclState.EvalBytes(b, project, cfg.inputVals); err != nil {
-		return nil, err
+	project, err := parseConfig(cmd.Context(), path, name, vars)
+	if err != nil {
+		return nil, nil, err
 	}
-	envs := make(map[string][]*Env)
+	// The atlas.hcl token predates 'atlas login' command. If exists,
+	// attach it to the context to indicate the user is authenticated.
+	if err := maySetLoginContext(cmd, project); err != nil {
+		return nil, nil, err
+	}
+	if err := project.Lint.remainedLog(); err != nil {
+		return nil, nil, err
+	}
 	for _, e := range project.Envs {
 		if e.Name == "" {
-			return nil, fmt.Errorf("all envs must have names on file %q", path)
+			return nil, nil, fmt.Errorf("all envs must have names on file %q", path)
 		}
 		if _, err := e.Sources(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if e.Migration == nil {
 			e.Migration = &Migration{}
 		}
+		if err := e.remainedLog(); err != nil {
+			return nil, nil, err
+		}
+		e.Diff = e.Diff.Extend(project.Diff)
 		e.Lint = e.Lint.Extend(project.Lint)
+		if err := e.Lint.remainedLog(); err != nil {
+			return nil, nil, err
+		}
+		e.Test = e.Test.Extend(project.Test)
 		envs[e.Name] = append(envs[e.Name], e)
 	}
-	selected, ok := envs[name]
-	if !ok {
-		return nil, fmt.Errorf("env %q not defined in project file", name)
+	envsCache.store(GlobalFlags.ConfigURL, name, vars, project, envs[name])
+	switch {
+	case name == "":
+		// If no env was selected,
+		// return only the project.
+		return project, nil, nil
+	case len(envs[name]) == 0:
+		return nil, nil, fmt.Errorf("env %q not defined in config file", name)
+	default:
+		return project, envs[name], nil
 	}
-	return selected, nil
+}
+
+type (
+	envCacheK struct {
+		path, env, vars string
+	}
+	envCacheV struct {
+		p *Project
+		e []*Env
+	}
+	envCache struct {
+		sync.RWMutex
+		m map[envCacheK]envCacheV
+	}
+)
+
+var envsCache = &envCache{m: make(map[envCacheK]envCacheV)}
+
+func (c *envCache) load(path, env string, vars Vars) (*Project, []*Env, bool) {
+	c.RLock()
+	v, ok := c.m[envCacheK{path: path, env: env, vars: vars.String()}]
+	c.RUnlock()
+	return v.p, v.e, ok
+}
+
+func (c *envCache) store(path, env string, vars Vars, p *Project, e []*Env) {
+	c.Lock()
+	c.m[envCacheK{path: path, env: env, vars: vars.String()}] = envCacheV{p: p, e: e}
+	c.Unlock()
+}
+
+const (
+	blockEnv          = "env"
+	refAtlas          = "atlas"
+	defaultConfigPath = "file://atlas.hcl"
+)
+
+func parseConfig(ctx context.Context, path, env string, vars map[string]cty.Value) (*Project, error) {
+	pr, err := partialParse(path, env)
+	if err != nil {
+		return nil, err
+	}
+	base, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	cloud := &cmdext.AtlasConfig{
+		Project: cloudapi.DefaultProjectName,
+	}
+	state := schemahcl.New(
+		append(
+			append(cmdext.SpecOptions, specOptions...),
+			cloud.InitBlock(),
+			schemahcl.WithContext(ctx),
+			schemahcl.WithScopedEnums("env.migration.format", cmdmigrate.Formats...),
+			schemahcl.WithScopedEnums("env.migration.exec_order", "LINEAR", "LINEAR_SKIP", "NON_LINEAR"),
+			schemahcl.WithScopedEnums("env.lint.review", ReviewModes...),
+			schemahcl.WithScopedEnums("lint.review", ReviewModes...),
+			schemahcl.WithVariables(map[string]cty.Value{
+				refAtlas: cty.ObjectVal(map[string]cty.Value{
+					blockEnv: cty.StringVal(env),
+				}),
+			}),
+			schemahcl.WithFunctions(map[string]function.Function{
+				"file":    schemahcl.MakeFileFunc(base),
+				"glob":    schemahcl.MakeGlobFunc(base),
+				"fileset": schemahcl.MakeFileSetFunc(base),
+				"getenv":  getEnvFunc,
+			}),
+		)...,
+	)
+	p := &Project{Lint: &Lint{}, Diff: &Diff{}, cloud: cloud}
+	if err := state.Eval(pr, p, vars); err != nil {
+		return nil, err
+	}
+	for _, e := range p.Envs {
+		e.config, e.cloud = p, cloud
+	}
+	return p, nil
 }
 
 func init() {
-	schemahcl.Register("env", &Env{})
+	cloudapi.SetVersion(version, flavor)
+	schemahcl.Register(blockEnv, &Env{})
 }
 
-// sqlsrc represents an SQL data-source.
-type sqlsrc struct {
-	ctx   *hcl.EvalContext
-	block *hclsyntax.Block
-}
-
-// exec executes the source block for getting the data.
-func (s *sqlsrc) exec() (cty.Value, error) {
-	var (
-		in struct {
-			URL    string   `hcl:"url"`
-			Query  string   `hcl:"query"`
-			Remain hcl.Body `hcl:",remain"`
-			Args   []any
-		}
-		values []cty.Value
-	)
-	if diags := gohcl.DecodeBody(s.block.Body, s.ctx, &in); diags.HasErrors() {
-		return cty.NilVal, s.errorf("decoding body: %v", diags)
+func partialParse(path, env string) (*hclparse.Parser, error) {
+	parser := hclparse.NewParser()
+	fi, err := parser.ParseHCLFile(path)
+	if err != nil {
+		return nil, err
 	}
-	attrs, diags := in.Remain.JustAttributes()
-	if diags.HasErrors() {
-		return cty.NilVal, s.errorf("getting attributes: %v", diags)
-	}
-	if at, ok := attrs["args"]; ok {
-		switch v, diags := at.Expr.Value(s.ctx); {
-		case diags.HasErrors():
-			return cty.NilVal, s.errorf(`evaluating "args": %w`, diags)
-		case !v.CanIterateElements():
-			return cty.NilVal, s.errorf(`attribute "args" must be a list, got: %s`, v.Type())
-		default:
-			for it := v.ElementIterator(); it.Next(); {
-				switch _, v := it.Element(); v.Type() {
-				case cty.String:
-					in.Args = append(in.Args, v.AsString())
-				case cty.Number:
-					f, _ := v.AsBigFloat().Float64()
-					in.Args = append(in.Args, f)
-				case cty.Bool:
-					in.Args = append(in.Args, v.True())
-				default:
-					return cty.NilVal, s.errorf(`attribute "args" must be a list of strings, numbers or booleans, got: %s`, v.Type())
+	var labeled, nonlabeled, used []*hclsyntax.Block
+	for _, b := range fi.Body.(*hclsyntax.Body).Blocks {
+		switch b.Type {
+		case blockEnv:
+			switch n := len(b.Labels); {
+			// No env was selected.
+			case env == "" && n == 0:
+			// Exact env was selected.
+			case n == 1 && b.Labels[0] == env:
+				labeled = append(labeled, b)
+			// Dynamic env selection.
+			case n == 0 && b.Body != nil && b.Body.Attributes[schemahcl.AttrName] != nil:
+				t, ok := b.Body.Attributes[schemahcl.AttrName].Expr.(*hclsyntax.ScopeTraversalExpr)
+				if ok && len(t.Traversal) == 2 && t.Traversal.RootName() == refAtlas && t.Traversal[1].(hcl.TraverseAttr).Name == blockEnv {
+					nonlabeled = append(nonlabeled, b)
 				}
 			}
-		}
-		delete(attrs, "args")
-	}
-	if len(attrs) > 0 {
-		return cty.NilVal, s.errorf("unexpected attributes: %v", attrs)
-	}
-	c, err := sqlclient.Open(context.Background(), in.URL)
-	if err != nil {
-		return cty.NilVal, s.errorf("opening connection: %w", err)
-	}
-	defer c.Close()
-	rows, err := c.QueryContext(context.Background(), in.Query, in.Args...)
-	if err != nil {
-		return cty.NilVal, s.errorf("executing query: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var v any
-		if err := rows.Scan(&v); err != nil {
-			return cty.NilVal, s.errorf("scanning row: %w", err)
-		}
-		switch v := v.(type) {
-		case bool:
-			values = append(values, cty.BoolVal(v))
-		case int64:
-			values = append(values, cty.NumberIntVal(v))
-		case float64:
-			values = append(values, cty.NumberFloatVal(v))
-		case string:
-			values = append(values, cty.StringVal(v))
-		case []byte:
-			values = append(values, cty.StringVal(string(v)))
 		default:
-			return cty.NilVal, s.errorf("unsupported row type: %T", v)
+			used = append(used, b)
 		}
 	}
-	obj := map[string]cty.Value{
-		"count":  cty.NumberIntVal(int64(len(values))),
-		"values": cty.ListValEmpty(cty.NilType),
-		"value":  cty.NilVal,
+	// Labeled blocks take precedence
+	// over non-labeled env blocks.
+	switch {
+	case len(labeled) > 0:
+		used = append(used, labeled...)
+	case len(nonlabeled) > 0:
+		used = append(used, nonlabeled...)
 	}
-	if len(values) > 0 {
-		obj["value"] = values[0]
-		obj["values"] = cty.ListVal(values)
+	fi.Body = &hclsyntax.Body{
+		Blocks:     used,
+		Attributes: fi.Body.(*hclsyntax.Body).Attributes,
 	}
-	return cty.ObjectVal(obj), nil
+	return parser, nil
 }
 
-func (s *sqlsrc) errorf(format string, args ...any) error {
-	return fmt.Errorf("data.sql.%s: %w", s.block.Labels[1], fmt.Errorf(format, args...))
-}
+// Review modes for 'schema apply'.
+const (
+	ReviewAlways  = "ALWAYS"  // Always review changes. The default mode.
+	ReviewWarning = "WARNING" // Review changes only if there are any diagnostics (including warnings).
+	ReviewError   = "ERROR"   // Review changes only if there are severe diagnostics (error level).
+)
+
+var ReviewModes = []string{ReviewAlways, ReviewWarning, ReviewError}
+
+// getEnvFunc is a custom HCL function that returns
+// the value of an environment variable.
+var getEnvFunc = function.New(&function.Spec{
+	Params: []function.Parameter{
+		{
+			Name: "key",
+			Type: cty.String,
+		},
+	},
+	Type: function.StaticReturnType(cty.String),
+	Impl: func(args []cty.Value, retType cty.Type) (cty.Value, error) {
+		return cty.StringVal(os.Getenv(args[0].AsString())), nil
+	},
+})

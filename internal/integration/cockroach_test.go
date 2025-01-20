@@ -16,9 +16,6 @@ import (
 	"ariga.io/atlas/sql/migrate"
 	"ariga.io/atlas/sql/postgres"
 	"ariga.io/atlas/sql/schema"
-	"entgo.io/ent/dialect"
-	entschema "entgo.io/ent/dialect/sql/schema"
-	entmigrate "entgo.io/ent/entc/integration/ent/migrate"
 
 	_ "github.com/lib/pq"
 	"github.com/stretchr/testify/require"
@@ -236,7 +233,10 @@ func TestCockroach_Enums(t *testing.T) {
 		})
 
 		// Create table with an enum column.
-		err := t.drv.ApplyChanges(ctx, []schema.Change{&schema.AddTable{T: usersT}})
+		err := t.drv.ApplyChanges(ctx, []schema.Change{
+			&schema.AddObject{O: &schema.EnumType{T: "state", Values: []string{"on", "off"}, Schema: usersT.Schema}},
+			&schema.AddTable{T: usersT},
+		})
 		require.NoError(t, err, "create a new table with an enum column")
 		t.dropTables(usersT.Name)
 		ensureNoChange(t, usersT)
@@ -248,43 +248,12 @@ func TestCockroach_Enums(t *testing.T) {
 		)
 		changes := t.diff(t.loadUsers(), usersT)
 		require.Len(t, changes, 1)
-		err = t.drv.ApplyChanges(ctx, []schema.Change{&schema.ModifyTable{T: usersT, Changes: changes}})
+		err = t.drv.ApplyChanges(ctx, []schema.Change{
+			&schema.AddObject{O: &schema.EnumType{T: "day", Values: []string{"sunday", "monday"}, Schema: usersT.Schema}},
+			&schema.ModifyTable{T: usersT, Changes: changes},
+		})
 		require.NoError(t, err, "add a new enum column to existing table")
 		ensureNoChange(t, usersT)
-
-		// Add a new value to an existing enum.
-		e := usersT.Columns[2].Type.Type.(*schema.EnumType)
-		e.Values = append(e.Values, "tuesday")
-		changes = t.diff(t.loadUsers(), usersT)
-		require.Len(t, changes, 1)
-		err = t.drv.ApplyChanges(ctx, []schema.Change{&schema.ModifyTable{T: usersT, Changes: changes}})
-		require.NoError(t, err, "append a value to existing enum")
-		ensureNoChange(t, usersT)
-
-		// Add multiple new values to an existing enum.
-		e = usersT.Columns[2].Type.Type.(*schema.EnumType)
-		e.Values = append(e.Values, "wednesday", "thursday", "friday", "saturday")
-		changes = t.diff(t.loadUsers(), usersT)
-		require.Len(t, changes, 1)
-		err = t.drv.ApplyChanges(ctx, []schema.Change{&schema.ModifyTable{T: usersT, Changes: changes}})
-		require.NoError(t, err, "append multiple values to existing enum")
-		ensureNoChange(t, usersT)
-	})
-}
-
-func TestCockroach_Ent(t *testing.T) {
-	crdbRun(t, func(t *crdbTest) {
-		// Cockroach doesn't support macaddr but its in the integration tests of ent
-		for _, ff := range entmigrate.FieldTypesColumns {
-			if st := ff.SchemaType; st[dialect.Postgres] == "macaddr" {
-				c := ff
-				t.Cleanup(func() {
-					c.SchemaType = st
-				})
-				c.SchemaType = nil
-			}
-		}
-		testEntIntegration(t, dialect.Postgres, t.db, entschema.WithAtlas(true))
 	})
 }
 
@@ -840,6 +809,7 @@ func (t *crdbTest) valueByVersion(values map[string]string, defaults string) str
 func (t *crdbTest) loadRealm() *schema.Realm {
 	r, err := t.drv.InspectRealm(context.Background(), &schema.InspectRealmOption{
 		Schemas: []string{"public"},
+		Mode:    schema.InspectSchemas | schema.InspectTables,
 	})
 	require.NoError(t, err)
 	return r
@@ -926,10 +896,6 @@ func (t *crdbTest) realm() *schema.Realm {
 			{
 				Name: "public",
 			},
-		},
-		Attrs: []schema.Attr{
-			&schema.Collation{V: "C.UTF-8"},
-			&postgres.CType{V: "C.UTF-8"},
 		},
 	}
 	r.Schemas[0].Realm = r

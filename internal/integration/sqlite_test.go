@@ -20,7 +20,6 @@ import (
 	"ariga.io/atlas/sql/schema"
 	"ariga.io/atlas/sql/sqlite"
 
-	"entgo.io/ent/dialect"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/require"
 )
@@ -62,12 +61,6 @@ func TestSQLite_AddDropTable(t *testing.T) {
 func TestSQLite_Relation(t *testing.T) {
 	liteRun(t, func(t *liteTest) {
 		testRelation(t)
-	})
-}
-
-func TestSQLite_Ent(t *testing.T) {
-	liteRun(t, func(t *liteTest) {
-		testEntIntegration(t, dialect.SQLite, t.db)
 	})
 }
 
@@ -231,7 +224,7 @@ func TestSQLite_AddColumns(t *testing.T) {
 			&schema.Column{Name: "null_real", Type: &schema.ColumnType{Type: &schema.FloatType{T: "real"}, Null: true}},
 			&schema.Column{Name: "notnull_real", Type: &schema.ColumnType{Type: &schema.FloatType{T: "real"}}, Default: &schema.Literal{V: "1.0"}},
 			&schema.Column{Name: "null_text", Type: &schema.ColumnType{Type: &schema.StringType{T: "text"}, Null: true}},
-			&schema.Column{Name: "notnull_text1", Type: &schema.ColumnType{Type: &schema.StringType{T: "text"}}, Default: &schema.RawExpr{X: "hello"}},
+			&schema.Column{Name: "notnull_text1", Type: &schema.ColumnType{Type: &schema.StringType{T: "text"}}, Default: &schema.Literal{V: "hello"}},
 			&schema.Column{Name: "notnull_text2", Type: &schema.ColumnType{Type: &schema.StringType{T: "text"}}, Default: &schema.Literal{V: "'hello'"}},
 			&schema.Column{Name: "null_blob", Type: &schema.ColumnType{Type: &schema.BinaryType{T: "blob"}, Null: true}},
 			&schema.Column{Name: "notnull_blob", Type: &schema.ColumnType{Type: &schema.BinaryType{T: "blob"}}, Default: &schema.Literal{V: "'blob'"}},
@@ -514,7 +507,7 @@ env "hello" {
 	})
 	t.Run("SchemaApply", func(t *testing.T) {
 		liteRun(t, func(t *liteTest) {
-			testCLISchemaApply(t, h, t.url(""))
+			testCLISchemaApply(t, h, t.url(""), "--dev-url", t.dev())
 		})
 	})
 	t.Run("SchemaApplyWithVars", func(t *testing.T) {
@@ -533,7 +526,7 @@ table "users" {
 }
 `
 		liteRun(t, func(t *liteTest) {
-			testCLISchemaApply(t, h, t.url(""), "--var", "tenant=main")
+			testCLISchemaApply(t, h, t.url(""), "--var", "tenant=main", "--dev-url", t.dev())
 		})
 	})
 	t.Run("SchemaApplyDryRun", func(t *testing.T) {
@@ -826,6 +819,7 @@ func (t *liteTest) applyHcl(spec string) {
 func (t *liteTest) loadRealm() *schema.Realm {
 	r, err := t.drv.InspectRealm(context.Background(), &schema.InspectRealmOption{
 		Schemas: []string{"main"},
+		Mode:    schema.InspectSchemas | schema.InspectTables,
 	})
 	require.NoError(t, err)
 	return r
@@ -942,6 +936,10 @@ func (t *liteTest) dropTables(names ...string) {
 
 func (t *liteTest) url(_ string) string {
 	return fmt.Sprintf("sqlite://file:%s?cache=shared&_fk=1", t.file)
+}
+
+func (t *liteTest) dev() string {
+	return fmt.Sprintf("sqlite://%s?mode=memory&_fk=1", t.Name())
 }
 
 func (t *liteTest) applyRealmHcl(spec string) {

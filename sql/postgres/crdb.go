@@ -12,24 +12,22 @@ import (
 	"strings"
 
 	"ariga.io/atlas/sql/internal/sqlx"
+	"ariga.io/atlas/sql/migrate"
 	"ariga.io/atlas/sql/schema"
-	"ariga.io/atlas/sql/sqlclient"
 )
 
-func init() {
-	sqlclient.Register(
-		"cockroach",
-		sqlclient.DriverOpener(Open),
-		sqlclient.RegisterCodec(MarshalHCL, EvalHCL),
-		sqlclient.RegisterFlavours("crdb"),
-		sqlclient.RegisterURLParser(parser{}),
-	)
-}
-
-// crdbDiff implements the sqlx.DiffDriver for CockroachDB.
 type (
 	crdbDiff    struct{ diff }
 	crdbInspect struct{ inspect }
+	noLocker    interface {
+		migrate.Driver
+		migrate.Snapshoter
+		migrate.CleanChecker
+		schema.Normalizer
+	}
+	noLockDriver struct {
+		noLocker
+	}
 )
 
 var _ sqlx.DiffDriver = (*crdbDiff)(nil)
@@ -74,13 +72,13 @@ func (i *crdbInspect) InspectRealm(ctx context.Context, opts *schema.InspectReal
 }
 
 // Normalize implements the sqlx.Normalizer.
-func (cd *crdbDiff) Normalize(from, to *schema.Table) error {
+func (cd *crdbDiff) Normalize(from, to *schema.Table, _ *schema.DiffOptions) error {
 	cd.normalize(from)
 	cd.normalize(to)
 	return nil
 }
 
-func (cd *crdbDiff) ColumnChange(fromT *schema.Table, from, to *schema.Column) (schema.ChangeKind, error) {
+func (cd *crdbDiff) ColumnChange(fromT *schema.Table, from, to *schema.Column, opts *schema.DiffOptions) (schema.Change, error) {
 	// All serial types in Cockroach are implemented as bigint.
 	// See: https://www.cockroachlabs.com/docs/stable/serial.html#generated-values-for-mode-sql_sequence-and-sql_sequence_cached.
 	for _, c := range []*schema.Column{from, to} {
@@ -92,7 +90,7 @@ func (cd *crdbDiff) ColumnChange(fromT *schema.Table, from, to *schema.Column) (
 			from.Default = nil
 		}
 	}
-	return cd.diff.ColumnChange(fromT, from, to)
+	return cd.diff.ColumnChange(fromT, from, to, opts)
 }
 
 func (cd *crdbDiff) normalize(table *schema.Table) {
@@ -175,8 +173,6 @@ func (cd *crdbDiff) normalize(table *schema.Table) {
 				// is equivalent to character(1).
 				t.Size = 1
 			}
-		case *enumType:
-			c.Type.Type = &schema.EnumType{T: t.T, Values: t.Values}
 		}
 	}
 }
@@ -228,7 +224,7 @@ func (i *inspect) crdbAddIndexes(s *schema.Schema, rows *sql.Rows) error {
 				idx.Attrs = append(idx.Attrs, &schema.Comment{Text: comment.String})
 			}
 			if sqlx.ValidString(contype) {
-				idx.Attrs = append(idx.Attrs, &ConType{T: contype.String})
+				idx.Attrs = append(idx.Attrs, &Constraint{T: contype.String})
 			}
 			if sqlx.ValidString(pred) {
 				idx.Attrs = append(idx.Attrs, &IndexPredicate{P: pred.String})
@@ -266,15 +262,18 @@ const (
 	TypeGeometry = "geometry"
 )
 
-// CockroachDB query for getting schema indexes.
-const crdbIndexesQuery = `
+const (
+	// CockroachDB query for getting schema indexes.
+	// Scanning constraints is disabled due to internal CockroachDB error.
+	// (internal error: unexpected type *tree.DOidWrapper for key value)
+	crdbIndexesQuery = `
 SELECT
 	t.relname AS table_name,
 	i.relname AS index_name,
 	a.attname AS column_name,
 	idx.indisprimary AS primary,
 	idx.indisunique AS unique,
-	c.contype AS constraint_type,
+	NULL AS constraints,
 	pgi.indexdef create_stmt,
 	pg_get_expr(idx.indpred, idx.indrelid) AS predicate,
 	pg_get_indexdef(idx.indexrelid, idx.ord, false) AS expression,
@@ -290,18 +289,16 @@ SELECT
 	JOIN pg_class i ON i.oid = idx.indexrelid
 	JOIN pg_class t ON t.oid = idx.indrelid
 	JOIN pg_namespace n ON n.oid = t.relnamespace
-	LEFT JOIN pg_constraint c ON idx.indexrelid = c.conindid
 	LEFT JOIN pg_indexes pgi ON pgi.tablename = t.relname AND indexname = i.relname AND n.nspname = pgi.schemaname
 	LEFT JOIN pg_attribute a ON (a.attrelid, a.attnum) = (idx.indrelid, idx.key)
 WHERE
 	n.nspname = $1
 	AND t.relname IN (%s)
-	AND COALESCE(c.contype, '') <> 'f'
 ORDER BY
 	table_name, index_name, idx.ord
 `
 
-const crdbColumnsQuery = `
+	crdbColumnsQuery = `
 SELECT
 	t1.table_name,
 	t1.column_name,
@@ -325,8 +322,8 @@ SELECT
 	col_description(t3.oid, "ordinal_position") AS comment,
 	t4.typtype,
 	t4.typelem,
-	(CASE WHEN t4.typcategory = 'A' AND t4.typelem <> 0 THEN (SELECT t.typtype FROM pg_catalog.pg_type t WHERE t.oid = t4.typelem) END) AS elemtyp,
-	t4.oid
+	t4.oid,
+	a.attnum
 FROM
 	"information_schema"."columns" AS t1
 	JOIN pg_catalog.pg_namespace AS t2 ON t2.nspname = t1.table_schema
@@ -341,3 +338,4 @@ WHERE
 ORDER BY
 	t1.table_name, t1.ordinal_position
 `
+)

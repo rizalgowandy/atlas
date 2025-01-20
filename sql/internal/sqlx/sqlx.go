@@ -12,8 +12,10 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"ariga.io/atlas/sql/schema"
 )
@@ -67,7 +69,7 @@ func ScanOne(rows *sql.Rows, dest ...any) error {
 	if err := rows.Scan(dest...); err != nil {
 		return err
 	}
-	return rows.Close()
+	return rows.Err()
 }
 
 // ScanNullBool scans one sql.NullBool record and closes the rows at the end.
@@ -81,22 +83,62 @@ func ScanStrings(rows *sql.Rows) ([]string, error) {
 	defer rows.Close()
 	var vs []string
 	for rows.Next() {
-		var v string
+		var v sql.NullString
 		if err := rows.Scan(&v); err != nil {
 			return nil, err
 		}
-		vs = append(vs, v)
+		vs = append(vs, v.String)
 	}
 	return vs, nil
 }
+
+type (
+	// ScanStringer groups the fmt.Stringer and sql.Scanner interfaces.
+	ScanStringer interface {
+		fmt.Stringer
+		sql.Scanner
+	}
+	// nullString is a sql.NullString that implements the ScanStringer interface.
+	nullString struct{ sql.NullString }
+)
+
+func (s nullString) String() string    { return s.NullString.String }
+func (s *nullString) Scan(v any) error { return s.NullString.Scan(v) }
 
 // SchemaFKs scans the rows and adds the foreign-key to the schema table.
 // Reference elements are added as stubs and should be linked manually by the
 // caller.
 func SchemaFKs(s *schema.Schema, rows *sql.Rows) error {
+	return TypedSchemaFKs[*nullString](s, rows)
+}
+
+// FKAttrScanner allows extending foreign-keys
+// scanning with extra attributes.
+type FKAttrScanner struct {
+	Columns  func() []any
+	ScanFunc func(*schema.ForeignKey, []any) error
+}
+
+// TypedSchemaFKs is a version of SchemaFKs that allows to specify the type of
+// used to scan update and delete actions from the database.
+func TypedSchemaFKs[T ScanStringer](s *schema.Schema, rows *sql.Rows, attr ...*FKAttrScanner) error {
 	for rows.Next() {
-		var name, table, column, tSchema, refTable, refColumn, refSchema, updateRule, deleteRule string
-		if err := rows.Scan(&name, &table, &column, &tSchema, &refTable, &refColumn, &refSchema, &updateRule, &deleteRule); err != nil {
+		var (
+			updateAction, deleteAction                                   = V(new(T)), V(new(T))
+			name, table, column, tSchema, refTable, refColumn, refSchema string
+			columns                                                      = []any{
+				&name, &table, &column, &tSchema, &refTable, &refColumn, &refSchema, &updateAction, &deleteAction,
+			}
+			origin = len(columns)
+		)
+		// Allows to scan extra attributes.
+		switch {
+		case len(attr) > 1:
+			return fmt.Errorf("unexpected number of attributes scanners: %d", len(attr))
+		case len(attr) == 1:
+			columns = append(columns, attr[0].Columns()...)
+		}
+		if err := rows.Scan(columns...); err != nil {
 			return err
 		}
 		t, ok := s.Table(table)
@@ -109,15 +151,18 @@ func SchemaFKs(s *schema.Schema, rows *sql.Rows) error {
 				Symbol:   name,
 				Table:    t,
 				RefTable: t,
-				OnDelete: schema.ReferenceOption(deleteRule),
-				OnUpdate: schema.ReferenceOption(updateRule),
+				OnUpdate: schema.ReferenceOption(updateAction.String()),
+				OnDelete: schema.ReferenceOption(deleteAction.String()),
 			}
 			switch {
-			case refTable == table:
-			case tSchema == refSchema:
+			// Self reference.
+			case tSchema == refSchema && refTable == table:
+			// Reference to the same schema.
+			case tSchema == refSchema && refTable != table:
 				if fk.RefTable, ok = s.Table(refTable); !ok {
 					fk.RefTable = &schema.Table{Name: refTable, Schema: s}
 				}
+			// Reference to an external schema.
 			case tSchema != refSchema:
 				fk.RefTable = &schema.Table{Name: refTable, Schema: &schema.Schema{Name: refSchema}}
 			}
@@ -144,6 +189,11 @@ func SchemaFKs(s *schema.Schema, rows *sql.Rows) error {
 		}
 		if _, ok := fk.RefColumn(rc.Name); !ok {
 			fk.RefColumns = append(fk.RefColumns, rc)
+		}
+		if len(attr) == 1 {
+			if err := attr[0].ScanFunc(fk, columns[origin:]); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -197,25 +247,37 @@ func ValuesEqual(v1, v2 []string) bool {
 
 // ModeInspectSchema returns the InspectMode or its default.
 func ModeInspectSchema(o *schema.InspectOptions) schema.InspectMode {
-	if o == nil || o.Mode == 0 {
-		return schema.InspectSchemas | schema.InspectTables
+	if o != nil && o.Mode != 0 {
+		return o.Mode
 	}
-	return o.Mode
+	return modeSchemaOrAll(V(o).Exclude, "*")
 }
 
 // ModeInspectRealm returns the InspectMode or its default.
 func ModeInspectRealm(o *schema.InspectRealmOption) schema.InspectMode {
-	if o == nil || o.Mode == 0 {
-		return schema.InspectSchemas | schema.InspectTables
+	if o != nil && o.Mode != 0 {
+		return o.Mode
 	}
-	return o.Mode
+	return modeSchemaOrAll(V(o).Exclude, "*.*")
+}
+
+// modeSchemaOrAll returns the inspect mode based on the exclude patterns.
+func modeSchemaOrAll(exclude []string, match string) schema.InspectMode {
+	if slices.Contains(exclude, match) {
+		return schema.InspectSchemas
+	}
+	return schema.InspectSchemas | schema.InspectTables | schema.InspectViews | schema.InspectFuncs |
+		schema.InspectTypes | schema.InspectObjects | schema.InspectTriggers
 }
 
 // A Builder provides a syntactic sugar API for writing SQL statements.
 type Builder struct {
 	bytes.Buffer
-	QuoteChar byte    // quoting identifiers
-	Schema    *string // schema qualifier
+	QuoteOpening byte    // quoting identifiers
+	QuoteClosing byte    // quoting identifiers
+	Schema       *string // schema qualifier
+	Indent       string  // indentation string
+	level        int     // current indentation level
 }
 
 // P writes a list of phrases to the builder separated and
@@ -236,20 +298,105 @@ func (b *Builder) P(phrases ...string) *Builder {
 	return b
 }
 
+// Int64 writes the given value to the builder in base 10.
+func (b *Builder) Int64(v int64) *Builder {
+	return b.P(strconv.FormatInt(v, 10))
+}
+
 // Ident writes the given string quoted as an SQL identifier.
 func (b *Builder) Ident(s string) *Builder {
 	if s != "" {
-		b.WriteByte(b.QuoteChar)
+		b.WriteByte(b.QuoteOpening)
 		b.WriteString(s)
-		b.WriteByte(b.QuoteChar)
+		b.WriteByte(b.QuoteClosing)
 		b.WriteByte(' ')
 	}
 	return b
 }
 
+// View writes the view identifier to the builder, prefixed
+// with the schema name if exists.
+func (b *Builder) View(v *schema.View) *Builder {
+	return b.mayQualify(v.Schema, v.Name)
+}
+
 // Table writes the table identifier to the builder, prefixed
 // with the schema name if exists.
 func (b *Builder) Table(t *schema.Table) *Builder {
+	return b.mayQualify(t.Schema, t.Name)
+}
+
+// TableColumn writes the table's resource identifier to the builder, prefixed
+// with the schema name if exists.
+func (b *Builder) TableColumn(t *schema.Table, c *schema.Column) *Builder {
+	return b.mayQualify(t.Schema, t.Name, c.Name)
+}
+
+// Func writes the function identifier to the builder, prefixed
+// with the schema name if exists.
+func (b *Builder) Func(f *schema.Func) *Builder {
+	return b.mayQualify(f.Schema, f.Name)
+}
+
+// FuncCall writes the function identifier to the builder as a function call,
+func (b *Builder) FuncCall(f *schema.Func, args ...string) *Builder {
+	b.Func(f).rewriteLastByte('(')
+	b.MapComma(args, func(i int, b *Builder) {
+		b.WriteString(args[i])
+	})
+	b.WriteByte(')')
+	return b
+}
+
+// Proc writes the procedure identifier to the builder, prefixed
+// with the schema name if exists.
+func (b *Builder) Proc(p *schema.Proc) *Builder {
+	return b.mayQualify(p.Schema, p.Name)
+}
+
+// ProcCall writes the procedure identifier to the builder as a procedure call,
+func (b *Builder) ProcCall(p *schema.Proc, args ...string) *Builder {
+	b.Proc(p).rewriteLastByte('(')
+	b.MapComma(args, func(i int, b *Builder) {
+		b.WriteString(args[i])
+	})
+	b.WriteByte(')')
+	return b
+}
+
+// TableResource writes the table resource identifier to the builder, prefixed
+// with the schema name if exists.
+func (b *Builder) TableResource(t *schema.Table, r any) *Builder {
+	switch c := r.(type) {
+	case *schema.Column:
+		return b.TableColumn(t, c)
+	case *schema.Index:
+		return b.mayQualify(t.Schema, t.Name, c.Name)
+	default:
+		panic(fmt.Sprintf("unexpected table resource: %T", r))
+	}
+}
+
+// ViewResource writes the view resource identifier to the builder, prefixed
+// with the schema name if exists.
+func (b *Builder) ViewResource(v *schema.View, r any) *Builder {
+	switch c := r.(type) {
+	case *schema.Column:
+		return b.mayQualify(v.Schema, v.Name, c.Name)
+	case *schema.Index:
+		return b.mayQualify(v.Schema, v.Name, c.Name)
+	default:
+		panic(fmt.Sprintf("unexpected view resource: %T", r))
+	}
+}
+
+// SchemaResource writes the schema resource identifier to the builder, prefixed
+// with the schema name if exists.
+func (b *Builder) SchemaResource(s *schema.Schema, name string) *Builder {
+	return b.mayQualify(s, name)
+}
+
+func (b *Builder) mayQualify(s *schema.Schema, top string, children ...string) *Builder {
 	switch {
 	// Custom qualifier.
 	case b.Schema != nil:
@@ -259,11 +406,41 @@ func (b *Builder) Table(t *schema.Table) *Builder {
 			b.rewriteLastByte('.')
 		}
 	// Default schema qualifier.
-	case t.Schema != nil && t.Schema.Name != "":
-		b.Ident(t.Schema.Name)
+	case s != nil && s.Name != "":
+		b.Ident(s.Name)
 		b.rewriteLastByte('.')
 	}
-	b.Ident(t.Name)
+	b.Ident(top)
+	for _, ident := range children {
+		b.rewriteLastByte('.')
+		b.Ident(ident)
+	}
+	return b
+}
+
+// IndentIn adds one indentation in.
+func (b *Builder) IndentIn() *Builder {
+	b.level++
+	return b
+}
+
+// IndentOut removed one indentation level.
+func (b *Builder) IndentOut() *Builder {
+	b.level--
+	return b
+}
+
+// NL adds line break and prefix the new line with
+// indentation in case indentation is enabled.
+func (b *Builder) NL() *Builder {
+	if b.Indent != "" {
+		if b.lastByte() == ' ' {
+			b.rewriteLastByte('\n')
+		} else {
+			b.WriteByte('\n')
+		}
+		b.WriteString(strings.Repeat(b.Indent, b.level))
+	}
 	return b
 }
 
@@ -294,6 +471,26 @@ func (b *Builder) MapComma(x any, f func(i int, b *Builder)) *Builder {
 	return b
 }
 
+// Quote wraps the given function with a single quote and a prefix
+func (b *Builder) Quote(prefix string, fn func(b *Builder)) *Builder {
+	b.WriteString(prefix)
+	b.WriteByte('\'')
+	fn(b)
+	if b.lastByte() != ' ' {
+		b.WriteByte('\'')
+	} else {
+		b.rewriteLastByte('\'')
+	}
+	return b
+}
+
+// MapIndent is like MapComma, but writes a new line before each element.
+func (b *Builder) MapIndent(x any, f func(i int, b *Builder)) *Builder {
+	return b.MapComma(x, func(i int, b *Builder) {
+		f(i, b.NL())
+	})
+}
+
 // MapCommaErr is like MapComma, but returns an error if f returns an error.
 func (b *Builder) MapCommaErr(x any, f func(i int, b *Builder) error) error {
 	s := reflect.ValueOf(x)
@@ -308,6 +505,13 @@ func (b *Builder) MapCommaErr(x any, f func(i int, b *Builder) error) error {
 	return nil
 }
 
+// MapIndentErr is like MapCommaErr, but writes a new line before each element.
+func (b *Builder) MapIndentErr(x any, f func(i int, b *Builder) error) error {
+	return b.MapCommaErr(x, func(i int, b *Builder) error {
+		return f(i, b.NL())
+	})
+}
+
 // Wrap wraps the written string with parentheses.
 func (b *Builder) Wrap(f func(b *Builder)) *Builder {
 	b.WriteByte('(')
@@ -320,11 +524,41 @@ func (b *Builder) Wrap(f func(b *Builder)) *Builder {
 	return b
 }
 
+// WrapErr wraps the written string with parentheses
+func (b *Builder) WrapErr(f func(b *Builder) error) error {
+	var err error
+	b.Wrap(func(b *Builder) { err = f(b) })
+	return err
+}
+
+// WrapIndent is like Wrap but with extra level of indentation.
+func (b *Builder) WrapIndent(f func(b *Builder)) *Builder {
+	return b.Wrap(func(b *Builder) {
+		b.IndentIn()
+		f(b)
+		b.IndentOut()
+		b.NL()
+	})
+}
+
+// WrapIndentErr is like WrapErr but with extra level of indentation.
+func (b *Builder) WrapIndentErr(f func(b *Builder) error) error {
+	var err error
+	b.Wrap(func(b *Builder) {
+		b.IndentIn()
+		err = f(b)
+		b.IndentOut()
+		b.NL()
+	})
+	return err
+}
+
 // Clone returns a duplicate of the builder.
 func (b *Builder) Clone() *Builder {
 	return &Builder{
-		QuoteChar: b.QuoteChar,
-		Buffer:    *bytes.NewBufferString(b.Buffer.String()),
+		QuoteOpening: b.QuoteOpening,
+		QuoteClosing: b.QuoteClosing,
+		Buffer:       *bytes.NewBufferString(b.Buffer.String()),
 	}
 }
 
@@ -395,7 +629,7 @@ func IsLiteralNumber(s string) bool {
 
 // DefaultValue returns the string represents the DEFAULT of a column.
 func DefaultValue(c *schema.Column) (string, bool) {
-	switch x := c.Default.(type) {
+	switch x := schema.UnderlyingExpr(c.Default).(type) {
 	case nil:
 		return "", false
 	case *schema.Literal:
@@ -475,4 +709,14 @@ func V[T any](p *T) (v T) {
 		v = *p
 	}
 	return
+}
+
+// IsUint reports whether the string represents an unsigned integer.
+func IsUint(s string) bool {
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
 }

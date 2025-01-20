@@ -56,6 +56,8 @@ table "table" {
 	check "positive price" {
 		expr = "price > 0"
 	}
+	without_rowid = true
+	strict        = false
 }
 
 table "accounts" {
@@ -66,11 +68,10 @@ table "accounts" {
 	primary_key {
 		columns = [table.accounts.column.name]
 	}
+	strict = true
 }
 `
-	exp := &schema.Schema{
-		Name: "schema",
-	}
+	exp := schema.NewRealm(schema.New("schema")).Schemas[0]
 	exp.Tables = []*schema.Table{
 		{
 			Name:   "table",
@@ -118,6 +119,7 @@ table "accounts" {
 					Name: "positive price",
 					Expr: "price > 0",
 				},
+				&WithoutRowID{},
 			},
 		},
 		{
@@ -133,6 +135,9 @@ table "accounts" {
 						},
 					},
 				},
+			},
+			Attrs: []schema.Attr{
+				&Strict{},
 			},
 		},
 	}
@@ -172,9 +177,70 @@ table "accounts" {
 			{SeqNo: 0, C: exp.Tables[1].Columns[0]},
 		},
 	}
+	exp.Tables[0].Columns[0].AddIndexes(exp.Tables[0].PrimaryKey)
+	exp.Tables[0].Columns[0].AddIndexes(exp.Tables[0].Indexes[0])
+	exp.Tables[0].Columns[1].AddIndexes(exp.Tables[0].Indexes[0])
+	exp.Tables[1].Columns[0].AddIndexes(exp.Tables[1].PrimaryKey)
 	var s schema.Schema
 	err := EvalHCLBytes([]byte(f), &s, nil)
 	require.NoError(t, err)
+	require.EqualValues(t, exp, &s)
+}
+
+func TestUnmarshalViews(t *testing.T) {
+	f := `table "t1" {
+  schema = schema.public
+  column "id" {
+    null = false
+    type = int
+  }
+}
+view "v1" {
+ schema = schema.public
+ as     = "SELECT * FROM t2 WHERE id IS NOT NULL"
+}
+view "v2" {
+  schema = schema.public
+  column "id" {
+    null = false
+    type = int
+  }
+  as      = "SELECT * FROM t3 WHERE id IS NOT NULL ORDER BY id"
+  comment = "view comment"
+}
+view "v3" {
+  schema     = schema.public
+  as         = "SELECT * FROM v2 JOIN t1 USING (id)"
+  depends_on = [view.v1, table.t1]
+}
+schema "public" {
+}
+`
+	var (
+		r   schema.Realm
+		s   schema.Schema
+		exp = schema.New("public").
+			AddTables(
+				schema.NewTable("t1").
+					AddColumns(
+						schema.NewIntColumn("id", "int"),
+					),
+			).
+			AddViews(
+				schema.NewView("v1", "SELECT * FROM t2 WHERE id IS NOT NULL"),
+				schema.NewView("v2", "SELECT * FROM t3 WHERE id IS NOT NULL ORDER BY id").
+					AddColumns(
+						schema.NewIntColumn("id", "int"),
+					).
+					SetComment("view comment"),
+			)
+	)
+	exp.AddViews(
+		schema.NewView("v3", "SELECT * FROM v2 JOIN t1 USING (id)").
+			AddDeps(exp.Views[0], exp.Tables[0]),
+	)
+	r.AddSchemas(exp)
+	require.NoError(t, EvalHCLBytes([]byte(f), &s, nil))
 	require.EqualValues(t, exp, &s)
 }
 
@@ -197,7 +263,7 @@ func TestMarshalSpec_AutoIncrement(t *testing.T) {
 		},
 	}
 	s.Tables[0].Schema = s
-	buf, err := MarshalSpec(s, hclState)
+	buf, err := MarshalHCL(s)
 	require.NoError(t, err)
 	const expected = `table "users" {
   schema = schema.test
@@ -246,7 +312,7 @@ func TestMarshalSpec_IndexPredicate(t *testing.T) {
 			},
 		},
 	}
-	buf, err := MarshalSpec(s, hclState)
+	buf, err := MarshalHCL(s)
 	require.NoError(t, err)
 	const expected = `table "users" {
   schema = schema.test
@@ -282,7 +348,7 @@ func TestTypes(t *testing.T) {
 		},
 		{
 			typeExpr: `sql("custom")`,
-			expected: &schema.UnsupportedType{T: "custom"},
+			expected: &UserDefinedType{T: "custom"},
 		},
 		{
 			typeExpr: "tinyint(10)",
@@ -311,6 +377,10 @@ func TestTypes(t *testing.T) {
 		{
 			typeExpr: "int8(10)",
 			expected: &schema.IntegerType{T: "int8"},
+		},
+		{
+			typeExpr: "uint64",
+			expected: &schema.IntegerType{T: "uint64"},
 		},
 		{
 			typeExpr: "real",
@@ -390,7 +460,11 @@ func TestTypes(t *testing.T) {
 		},
 		{
 			typeExpr: "uuid",
-			expected: &UUIDType{T: "uuid"},
+			expected: &schema.UUIDType{T: "uuid"},
+		},
+		{
+			typeExpr: "jsonb",
+			expected: &schema.JSONType{T: "jsonb"},
 		},
 	} {
 		t.Run(tt.typeExpr, func(t *testing.T) {
@@ -409,7 +483,7 @@ schema "test" {
 			require.NoError(t, err)
 			colspec := test.Tables[0].Columns[0]
 			require.EqualValues(t, tt.expected, colspec.Type.Type)
-			spec, err := MarshalSpec(&test, hclState)
+			spec, err := MarshalHCL(&test)
 			require.NoError(t, err)
 			var after schema.Schema
 			err = EvalHCLBytes(spec, &after, nil)
@@ -417,6 +491,36 @@ schema "test" {
 			require.EqualValues(t, tt.expected, after.Tables[0].Columns[0].Type.Type)
 		})
 	}
+}
+
+func TestMarshalSpec_TableOptions(t *testing.T) {
+	s := schema.New("test").
+		AddTables(
+			schema.NewTable("users").
+				AddColumns(
+					schema.NewIntColumn("id", "int"),
+				).
+				AddAttrs(
+					&WithoutRowID{},
+					&Strict{},
+				),
+		)
+	s.Tables[0].SetSchema(s)
+	buf, err := MarshalHCL(s)
+	require.NoError(t, err)
+	const expected = `table "users" {
+  schema = schema.test
+  column "id" {
+    null = false
+    type = int
+  }
+  without_rowid = true
+  strict        = true
+}
+schema "test" {
+}
+`
+	require.EqualValues(t, expected, string(buf))
 }
 
 func TestInputVars(t *testing.T) {

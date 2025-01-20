@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"strconv"
+	"strings"
 	"testing"
 
 	"ariga.io/atlas/sql/internal/sqltest"
@@ -37,6 +38,8 @@ func TestPlanChanges(t *testing.T) {
 						Attrs: []schema.Attr{
 							&schema.Check{Expr: "(text <> '')"},
 							&schema.Check{Name: "positive_id", Expr: "(id <> 0)"},
+							&WithoutRowID{},
+							&Strict{},
 						},
 					},
 				},
@@ -44,7 +47,7 @@ func TestPlanChanges(t *testing.T) {
 			plan: &migrate.Plan{
 				Reversible:    true,
 				Transactional: true,
-				Changes:       []*migrate.Change{{Cmd: "CREATE TABLE `posts` (`id` integer NOT NULL, `text` text NULL, CHECK (text <> ''), CONSTRAINT `positive_id` CHECK (id <> 0))", Reverse: "DROP TABLE `posts`"}},
+				Changes:       []*migrate.Change{{Cmd: "CREATE TABLE `posts` (`id` integer NOT NULL, `text` text NULL, CHECK (text <> ''), CONSTRAINT `positive_id` CHECK (id <> 0)) WITHOUT ROWID, STRICT", Reverse: "DROP TABLE `posts`"}},
 			},
 		},
 		{
@@ -79,13 +82,47 @@ func TestPlanChanges(t *testing.T) {
 		},
 		{
 			changes: []schema.Change{
-				&schema.DropTable{T: &schema.Table{Name: "posts"}},
+				&schema.DropTable{T: schema.NewTable("posts").AddColumns(schema.NewIntColumn("id", "integer"))},
 			},
 			plan: &migrate.Plan{
+				Reversible:    true,
 				Transactional: true,
 				Changes: []*migrate.Change{
 					{Cmd: "PRAGMA foreign_keys = off"},
-					{Cmd: "DROP TABLE `posts`"},
+					{
+						Cmd:     "DROP TABLE `posts`",
+						Reverse: "CREATE TABLE `posts` (`id` integer NOT NULL)",
+					},
+					{Cmd: "PRAGMA foreign_keys = on"},
+				},
+			},
+		},
+		{
+			changes: []schema.Change{
+				&schema.DropTable{
+					T: func() *schema.Table {
+						id := schema.NewIntColumn("id", "int")
+						return schema.NewTable("posts").
+							SetComment("a8m's posts").
+							AddColumns(id).
+							AddIndexes(
+								schema.NewIndex("idx").AddColumns(id).SetComment("a8m's index"),
+							)
+					}(),
+				},
+			},
+			plan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{Cmd: "PRAGMA foreign_keys = off"},
+					{
+						Cmd: "DROP TABLE `posts`",
+						Reverse: []string{
+							"CREATE TABLE `posts` (`id` int NOT NULL)",
+							"CREATE INDEX `idx` ON `posts` (`id`)",
+						},
+					},
 					{Cmd: "PRAGMA foreign_keys = on"},
 				},
 			},
@@ -129,6 +166,64 @@ func TestPlanChanges(t *testing.T) {
 				},
 			},
 		},
+		// Add column with constant default value.
+		{
+			changes: []schema.Change{
+				func() schema.Change {
+					users := schema.NewTable("users").
+						AddColumns(schema.NewIntColumn("id", "bigint"))
+					return &schema.ModifyTable{
+						T: users,
+						Changes: []schema.Change{
+							&schema.AddColumn{
+								C: schema.NewStringColumn("name", "text").
+									SetDefault(&schema.Literal{V: "a8m"}),
+							},
+						},
+					}
+				}(),
+			},
+			plan: &migrate.Plan{
+				Reversible:    true,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{Cmd: "ALTER TABLE `users` ADD COLUMN `name` text NOT NULL DEFAULT 'a8m'", Reverse: "ALTER TABLE `users` DROP COLUMN `name`"},
+				},
+			},
+		},
+		// Add column with expression default value.
+		{
+			changes: []schema.Change{
+				func() schema.Change {
+					users := schema.NewTable("users").
+						AddColumns(
+							schema.NewIntColumn("id", "bigint"),
+							schema.NewStringColumn("name", "text").
+								SetDefault(&schema.RawExpr{X: "NOW()::TEXT"}),
+						)
+					return &schema.ModifyTable{
+						T: users,
+						Changes: []schema.Change{
+							&schema.AddColumn{
+								C: users.Columns[1],
+							},
+						},
+					}
+				}(),
+			},
+			plan: &migrate.Plan{
+				Reversible:    false,
+				Transactional: true,
+				Changes: []*migrate.Change{
+					{Cmd: "PRAGMA foreign_keys = off"},
+					{Cmd: "CREATE TABLE `new_users` (`id` bigint NOT NULL, `name` text NOT NULL DEFAULT (NOW()::TEXT))", Reverse: "DROP TABLE `new_users`"},
+					{Cmd: "INSERT INTO `new_users` (`id`) SELECT `id` FROM `users`"},
+					{Cmd: "DROP TABLE `users`"},
+					{Cmd: "ALTER TABLE `new_users` RENAME TO `users`"},
+					{Cmd: "PRAGMA foreign_keys = on"},
+				},
+			},
+		},
 		// Add VIRTUAL column.
 		{
 			changes: []schema.Change{
@@ -161,6 +256,7 @@ func TestPlanChanges(t *testing.T) {
 					users := schema.NewTable("users").
 						AddColumns(
 							schema.NewIntColumn("id", "bigint"),
+							schema.NewIntColumn("name", "text"),
 							schema.NewIntColumn("nid", "bigint").
 								SetGeneratedExpr(&schema.GeneratedExpr{Expr: "1", Type: "STORED"}),
 						)
@@ -168,7 +264,12 @@ func TestPlanChanges(t *testing.T) {
 						T: users,
 						Changes: []schema.Change{
 							&schema.AddColumn{
-								C: users.Columns[1],
+								C: users.Columns[2],
+							},
+							// Rename should be respected in INSERT command.
+							&schema.RenameColumn{
+								From: schema.NewColumn("uname"),
+								To:   users.Columns[1],
 							},
 						},
 					}
@@ -178,8 +279,8 @@ func TestPlanChanges(t *testing.T) {
 				Transactional: true,
 				Changes: []*migrate.Change{
 					{Cmd: "PRAGMA foreign_keys = off"},
-					{Cmd: "CREATE TABLE `new_users` (`id` bigint NOT NULL, `nid` bigint NOT NULL AS (1) STORED)", Reverse: "DROP TABLE `new_users`"},
-					{Cmd: "INSERT INTO `new_users` (`id`) SELECT `id` FROM `users`"},
+					{Cmd: "CREATE TABLE `new_users` (`id` bigint NOT NULL, `name` text NOT NULL, `nid` bigint NOT NULL AS (1) STORED)", Reverse: "DROP TABLE `new_users`"},
+					{Cmd: "INSERT INTO `new_users` (`id`, `name`) SELECT `id`, `uname` FROM `users`"},
 					{Cmd: "DROP TABLE `users`"},
 					{Cmd: "ALTER TABLE `new_users` RENAME TO `users`"},
 					{Cmd: "PRAGMA foreign_keys = on"},
@@ -195,6 +296,7 @@ func TestPlanChanges(t *testing.T) {
 							schema.NewIntColumn("id", "bigint"),
 							schema.NewIntColumn("rank", "int").SetDefault(&schema.Literal{V: "1"}),
 							schema.NewStringColumn("nick", "text").SetDefault(&schema.Literal{V: "a8m"}),
+							schema.NewStringColumn("expr", "text").SetDefault(&schema.RawExpr{X: "hex(1)"}),
 						},
 						Attrs: []schema.Attr{
 							&schema.Check{Expr: "(id <> 0)"},
@@ -227,8 +329,8 @@ func TestPlanChanges(t *testing.T) {
 				Transactional: true,
 				Changes: []*migrate.Change{
 					{Cmd: "PRAGMA foreign_keys = off"},
-					{Cmd: "CREATE TABLE `new_users` (`id` bigint NOT NULL, `rank` int NOT NULL DEFAULT 1, `nick` text NOT NULL DEFAULT 'a8m', CHECK (id <> 0))", Reverse: "DROP TABLE `new_users`"},
-					{Cmd: "INSERT INTO `new_users` (`id`, `rank`, `nick`) SELECT `id`, IFNULL(`rank`, 1) AS `rank`, IFNULL(`nick`, 'a8m') AS `nick` FROM `users`"},
+					{Cmd: "CREATE TABLE `new_users` (`id` bigint NOT NULL, `rank` int NOT NULL DEFAULT 1, `nick` text NOT NULL DEFAULT 'a8m', `expr` text NOT NULL DEFAULT (hex(1)), CHECK (id <> 0))", Reverse: "DROP TABLE `new_users`"},
+					{Cmd: "INSERT INTO `new_users` (`id`, `rank`, `nick`, `expr`) SELECT `id`, IFNULL(`rank`, 1) AS `rank`, IFNULL(`nick`, 'a8m') AS `nick`, `expr` FROM `users`"},
 					{Cmd: "DROP TABLE `users`"},
 					{Cmd: "ALTER TABLE `new_users` RENAME TO `users`"},
 					{Cmd: "PRAGMA foreign_keys = on"},
@@ -399,3 +501,143 @@ func TestPlanChanges(t *testing.T) {
 		})
 	}
 }
+
+func TestDefaultPlan(t *testing.T) {
+	changes, err := DefaultPlan.PlanChanges(context.Background(), "plan", []schema.Change{
+		&schema.AddTable{T: schema.NewTable("t1").AddColumns(schema.NewIntColumn("a", "int"))},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(changes.Changes))
+	require.Equal(t, "CREATE TABLE `t1` (`a` int NOT NULL)", changes.Changes[0].Cmd)
+
+	err = DefaultPlan.ApplyChanges(context.Background(), []schema.Change{
+		&schema.AddTable{T: schema.NewTable("t1").AddColumns(schema.NewIntColumn("a", "int"))},
+	})
+	require.EqualError(t, err, `create "t1" table: cannot execute statements without a database connection. use Open to create a new Driver`)
+}
+
+func TestIndentedPlan(t *testing.T) {
+	tests := []struct {
+		T   *schema.Table
+		Cmd string
+	}{
+		{
+			T: schema.NewTable("t1").
+				AddColumns(schema.NewIntColumn("a", "int")),
+			Cmd: join(
+				"CREATE TABLE `t1` (",
+				"  `a` int NOT NULL",
+				")",
+			),
+		},
+		{
+			T: schema.NewTable("t1").
+				AddColumns(
+					schema.NewIntColumn("a", "int"),
+					schema.NewIntColumn("b", "int"),
+				),
+			Cmd: join(
+				"CREATE TABLE `t1` (",
+				"  `a` int NOT NULL,",
+				"  `b` int NOT NULL",
+				")",
+			),
+		},
+		{
+			T: schema.NewTable("t1").
+				AddColumns(
+					schema.NewIntColumn("a", "int"),
+					schema.NewIntColumn("b", "int"),
+				).
+				SetPrimaryKey(
+					schema.NewPrimaryKey(schema.NewIntColumn("id", "int")),
+				),
+			Cmd: join(
+				"CREATE TABLE `t1` (",
+				"  `a` int NOT NULL,",
+				"  `b` int NOT NULL,",
+				"  `id` int NOT NULL,",
+				"  PRIMARY KEY (`id`)",
+				")",
+			),
+		},
+		{
+			T: schema.NewTable("t1").
+				AddColumns(
+					schema.NewIntColumn("a", "int"),
+					schema.NewIntColumn("b", "int"),
+				).
+				AddForeignKeys(
+					schema.NewForeignKey("fk1").
+						AddColumns(schema.NewIntColumn("a", "int")).
+						SetRefTable(schema.NewTable("t2")).
+						AddRefColumns(schema.NewIntColumn("a", "int")),
+					schema.NewForeignKey("fk2").
+						AddColumns(schema.NewIntColumn("a", "int")).
+						SetRefTable(schema.NewTable("t2")).
+						AddRefColumns(schema.NewIntColumn("a", "int")),
+				),
+			Cmd: join(
+				"CREATE TABLE `t1` (",
+				"  `a` int NOT NULL,",
+				"  `b` int NOT NULL,",
+				"  CONSTRAINT `fk1` FOREIGN KEY (`a`) REFERENCES `t2` (`a`),",
+				"  CONSTRAINT `fk2` FOREIGN KEY (`a`) REFERENCES `t2` (`a`)",
+				")",
+			),
+		},
+		{
+			T: schema.NewTable("t1").
+				AddColumns(
+					schema.NewIntColumn("a", "int"),
+					schema.NewIntColumn("b", "int"),
+				).
+				SetPrimaryKey(
+					schema.NewPrimaryKey(schema.NewIntColumn("id", "int")),
+				).
+				AddForeignKeys(
+					schema.NewForeignKey("fk1").
+						AddColumns(schema.NewIntColumn("a", "int")).
+						SetRefTable(schema.NewTable("t2")).
+						AddRefColumns(schema.NewIntColumn("a", "int")),
+					schema.NewForeignKey("fk2").
+						AddColumns(schema.NewIntColumn("a", "int")).
+						SetRefTable(schema.NewTable("t2")).
+						AddRefColumns(schema.NewIntColumn("a", "int")),
+				).
+				AddChecks(
+					schema.NewCheck().SetName("ck1").SetExpr("a > 0"),
+					schema.NewCheck().SetName("ck2").SetExpr("a > 0"),
+				),
+			Cmd: join(
+				"CREATE TABLE `t1` (",
+				"  `a` int NOT NULL,",
+				"  `b` int NOT NULL,",
+				"  `id` int NOT NULL,",
+				"  PRIMARY KEY (`id`),",
+				"  CONSTRAINT `fk1` FOREIGN KEY (`a`) REFERENCES `t2` (`a`),",
+				"  CONSTRAINT `fk2` FOREIGN KEY (`a`) REFERENCES `t2` (`a`),",
+				"  CONSTRAINT `ck1` CHECK (a > 0),",
+				"  CONSTRAINT `ck2` CHECK (a > 0)",
+				`)`,
+			),
+		},
+	}
+	for i, tt := range tests {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			db, mk, err := sqlmock.New()
+			require.NoError(t, err)
+			mock{mk}.systemVars("3.36.0")
+			drv, err := Open(db)
+			require.NoError(t, err)
+			plan, err := drv.PlanChanges(context.Background(), "wantPlan", []schema.Change{&schema.AddTable{T: tt.T}}, func(opts *migrate.PlanOptions) {
+				opts.Indent = "  "
+			})
+			require.NoError(t, err)
+			require.Len(t, plan.Changes, 1)
+			require.Equal(t, tt.Cmd, plan.Changes[0].Cmd)
+		})
+	}
+}
+
+func join(lines ...string) string { return strings.Join(lines, "\n") }

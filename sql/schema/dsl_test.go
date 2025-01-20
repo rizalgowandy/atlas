@@ -43,6 +43,7 @@ func TestSchema_AddTables(t *testing.T) {
 		schema.NewBoolColumn("active", "boolean"),
 		schema.NewNullStringColumn("name", "varchar", schema.StringSize(255)),
 		schema.NewTimeColumn("registered_at", "timestamp", schema.TimePrecision(6)),
+		schema.NewTimeColumn("open_time", "time", schema.TimeScale(2)),
 	}
 	users := schema.NewTable("users").
 		AddColumns(userColumns...).
@@ -74,6 +75,7 @@ func TestSchema_AddTables(t *testing.T) {
 		t,
 		func() *schema.Schema {
 			p := 6
+			scale := 2
 			s := &schema.Schema{Name: "public"}
 			users := &schema.Table{
 				Name:   "users",
@@ -86,6 +88,7 @@ func TestSchema_AddTables(t *testing.T) {
 					{Name: "active", Type: &schema.ColumnType{Type: &schema.BoolType{T: "boolean"}}},
 					{Name: "name", Type: &schema.ColumnType{Null: true, Type: &schema.StringType{T: "varchar", Size: 255}}},
 					{Name: "registered_at", Type: &schema.ColumnType{Null: false, Type: &schema.TimeType{T: "timestamp", Precision: &p}}},
+					{Name: "open_time", Type: &schema.ColumnType{Null: false, Type: &schema.TimeType{T: "time", Precision: nil, Scale: &scale}}},
 				},
 			}
 			s.Tables = append(s.Tables, users)
@@ -131,6 +134,16 @@ func TestSchema_AddTables(t *testing.T) {
 		}(),
 		schema.New("public").AddTables(users, posts),
 	)
+}
+
+func TestSchema_Views(t *testing.T) {
+	s := schema.New("public")
+	v1, v2 := schema.NewView("v1", "SELECT 1"), schema.NewView("v2", "SELECT 2")
+	s.AddViews(v1, v2)
+	require.Equal(t, []*schema.View{v1, v2}, s.Views)
+	v1.AddDeps(v2)
+	require.Equal(t, []schema.Object{v2}, v1.Deps)
+	require.Equal(t, []schema.Object{v1}, v2.Refs)
 }
 
 func TestSchema_SetCharset(t *testing.T) {
@@ -203,4 +216,29 @@ func TestCheck(t *testing.T) {
 		Expr:  "price1 > 0",
 		Attrs: []schema.Attr{enforced},
 	}, tbl.Attrs[1])
+}
+
+func TestRemoveAttr(t *testing.T) {
+	u := schema.NewTable("users")
+	require.Empty(t, u.Attrs)
+	u.SetComment("users table")
+	require.Len(t, u.Attrs, 1)
+	u.Attrs = schema.RemoveAttr[*schema.Comment](u.Attrs)
+	require.Empty(t, u.Attrs)
+
+	u.AddAttrs(&schema.Comment{}, &schema.Comment{})
+	require.Len(t, u.Attrs, 2)
+	u.Attrs = schema.RemoveAttr[*schema.Comment](u.Attrs)
+	require.Empty(t, u.Attrs)
+
+	u.SetCharset("charset")
+	u.SetComment("users table")
+	u.SetCollation("collation")
+	u.Attrs = schema.RemoveAttr[*schema.Comment](u.Attrs)
+	require.Len(t, u.Attrs, 2)
+	require.Equal(t, &schema.Charset{V: "charset"}, u.Attrs[0])
+	require.Equal(t, &schema.Collation{V: "collation"}, u.Attrs[1])
+	u.Attrs = schema.RemoveAttr[*schema.Collation](u.Attrs)
+	require.Len(t, u.Attrs, 1)
+	require.Equal(t, &schema.Charset{V: "charset"}, u.Attrs[0])
 }

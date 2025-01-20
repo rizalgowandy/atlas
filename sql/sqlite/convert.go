@@ -39,8 +39,10 @@ func FormatType(t schema.Type) (string, error) {
 		f = strings.ToLower(t.T)
 	case *schema.SpatialType:
 		f = strings.ToLower(t.T)
-	case *UUIDType:
+	case *schema.UUIDType:
 		f = strings.ToLower(t.T)
+	case *UserDefinedType:
+		f = t.T
 	case *schema.UnsupportedType:
 		return "", fmt.Errorf("sqlite: unsupported type: %q", t.T)
 	default:
@@ -55,7 +57,7 @@ func FormatType(t schema.Type) (string, error) {
 func ParseType(c string) (schema.Type, error) {
 	// A datatype may be zero or more names.
 	if c == "" {
-		return &schema.UnsupportedType{}, nil
+		return &schema.BinaryType{T: "blob"}, nil
 	}
 	parts := columnParts(c)
 	switch t := parts[0]; t {
@@ -63,7 +65,7 @@ func ParseType(c string) (schema.Type, error) {
 		return &schema.BoolType{T: t}, nil
 	case "blob":
 		return &schema.BinaryType{T: t}, nil
-	case "int2", "int8", "int", "integer", "tinyint", "smallint", "mediumint", "bigint", "unsigned big int":
+	case "int2", "int8", "int", "uint64", "integer", "tinyint", "smallint", "mediumint", "bigint", "unsigned big int":
 		// All integer types have the same "type affinity".
 		return &schema.IntegerType{T: t}, nil
 	case "real", "double", "double precision", "float":
@@ -95,13 +97,13 @@ func ParseType(c string) (schema.Type, error) {
 			ct.Size = int(p)
 		}
 		return ct, nil
-	case "json":
+	case "json", "jsonb":
 		return &schema.JSONType{T: t}, nil
 	case "date", "datetime", "time", "timestamp":
 		return &schema.TimeType{T: t}, nil
 	case "uuid":
-		return &UUIDType{T: t}, nil
+		return &schema.UUIDType{T: t}, nil
 	default:
-		return &schema.UnsupportedType{T: t}, nil
+		return &UserDefinedType{T: c}, nil
 	}
 }

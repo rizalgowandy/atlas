@@ -24,3 +24,10 @@ CREATE TABLE t5(
     /* comment */
     -- comment
 ) ENGINE=InnoDB;
+
+SELECT * FROM (
+  SELECT * FROM t1 # comment
+);
+
+# This is a statement's comment.
+SELECT * FROM t2;

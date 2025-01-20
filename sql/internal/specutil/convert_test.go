@@ -5,6 +5,7 @@
 package specutil
 
 import (
+	"math"
 	"testing"
 
 	"ariga.io/atlas/schemahcl"
@@ -12,6 +13,7 @@ import (
 	"ariga.io/atlas/sql/sqlspec"
 
 	"github.com/stretchr/testify/require"
+	"github.com/zclconf/go-cty/cty"
 )
 
 func TestFromSpec_SchemaName(t *testing.T) {
@@ -22,12 +24,17 @@ func TestFromSpec_SchemaName(t *testing.T) {
 		},
 	}
 	sc.Tables[0].Schema = sc
-	s, ta, err := FromSchema(sc, func(table *schema.Table) (*sqlspec.Table, error) {
-		return &sqlspec.Table{}, nil
+	spec, err := FromSchema(sc, &SchemaFuncs{
+		Table: func(*schema.Table) (*sqlspec.Table, error) {
+			return &sqlspec.Table{}, nil
+		},
+		View: func(*schema.View) (*sqlspec.View, error) {
+			return &sqlspec.View{}, nil
+		},
 	})
 	require.NoError(t, err)
-	require.Equal(t, sc.Name, s.Name)
-	require.Equal(t, "$schema."+sc.Name, ta[0].Schema.V)
+	require.Equal(t, sc.Name, spec.Schema.Name)
+	require.Equal(t, "$schema."+sc.Name, spec.Tables[0].Schema.V)
 }
 
 func TestFromForeignKey(t *testing.T) {
@@ -88,4 +95,88 @@ func TestFromForeignKey(t *testing.T) {
 			{V: "$column.id"},
 		},
 	}, key)
+}
+
+func TestDefault(t *testing.T) {
+	for _, tt := range []struct {
+		v cty.Value
+		x string
+	}{
+		{
+			v: cty.NumberUIntVal(1),
+			x: "1",
+		},
+		{
+			v: cty.NumberIntVal(1),
+			x: "1",
+		},
+		{
+			v: cty.NumberFloatVal(1),
+			x: "1",
+		},
+		{
+			v: cty.NumberIntVal(-100),
+			x: "-100",
+		},
+		{
+			v: cty.NumberFloatVal(-100),
+			x: "-100",
+		},
+		{
+			v: cty.NumberUIntVal(math.MaxUint64),
+			x: "18446744073709551615",
+		},
+		{
+			v: cty.NumberIntVal(math.MinInt64),
+			x: "-9223372036854775808",
+		},
+		{
+			v: cty.NumberFloatVal(-1024.1024),
+			x: "-1024.1024",
+		},
+		{
+			v: cty.StringVal("{}"),
+			x: "{}",
+		},
+		{
+			v: cty.StringVal("1a.1"),
+			x: "1a.1",
+		},
+	} {
+		// From cty.Value (HCL) to database literal.
+		x, err := Default(tt.v)
+		require.NoError(t, err)
+		require.Equal(t, tt.x, x.(*schema.Literal).V)
+		// From database literal to cty.Value (HCL).
+		v, err := ColumnDefault(schema.NewColumn("").SetDefault(&schema.Literal{V: tt.x}))
+		require.NoError(t, err)
+		require.True(t, tt.v.Equals(v).True())
+	}
+}
+
+func TestColumnDefault_LiteralNumber(t *testing.T) {
+	v, err := ColumnDefault(
+		schema.NewColumn("").SetDefault(&schema.Literal{V: "0"}),
+	)
+	require.NoError(t, err)
+	require.True(t, cty.NumberIntVal(0).Equals(v).True())
+	v, err = ColumnDefault(
+		schema.NewStringColumn("", "text").SetDefault(&schema.Literal{V: "0"}),
+	)
+	require.NoError(t, err)
+	require.True(t, cty.StringVal("0").Equals(v).True())
+}
+
+func TestFromView(t *testing.T) {
+	spec, err := FromView(&schema.View{
+		Name:   "view",
+		Def:    "SELECT * FROM users\r\n WHERE c NOT LIKE \"\\r\\n\"",
+		Schema: schema.New("public").SetRealm(schema.NewRealm()),
+	}, nil, nil)
+	require.NoError(t, err)
+	as, ok := spec.DefaultExtension.Attr("as")
+	require.True(t, ok)
+	s, err := as.String()
+	require.NoError(t, err)
+	require.Equal(t, "<<-SQL\n  SELECT * FROM users\n   WHERE c NOT LIKE \"\\r\\n\"\n  SQL", s)
 }

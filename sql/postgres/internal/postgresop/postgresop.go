@@ -4,6 +4,8 @@
 
 package postgresop
 
+import "sync"
+
 // Class describes an index operator class.
 type Class struct {
 	Name    string // operator class name
@@ -191,4 +193,38 @@ var Classes = []*Class{
 	{Name: "quad_point_ops", Method: "SPGIST", Type: "point", Default: true},
 	{Name: "range_ops", Method: "SPGIST", Type: "anyrange", Default: true},
 	{Name: "text_ops", Method: "SPGIST", Type: "text", Default: true},
+	{Name: "gin_trgm_ops", Method: "GIN", Type: "text", Default: false},
+	{Name: "gist_trgm_ops", Method: "GIN", Type: "text", Default: false},
+	{Name: "btree_geography_ops", Method: "BTREE", Type: "geography", Default: true},
+	{Name: "btree_geometry_ops", Method: "BTREE", Type: "geometry", Default: true},
+	{Name: "gist_geography_ops", Method: "GIST", Type: "geography", Default: true},
+	{Name: "gist_geometry_ops_2d", Method: "GIST", Type: "geometry", Default: true},
+	{Name: "gist_geometry_ops_nd", Method: "GIST", Type: "geometry", Default: false},
+	{Name: "gist_geometry_ops_3d", Method: "GIST", Type: "geometry", Default: false},
+	{Name: "hash_geometry_ops", Method: "HASH", Type: "geometry", Default: true},
+	{Name: "brin_geography_inclusion_ops", Method: "BRIN", Type: "geography", Default: true},
+	{Name: "brin_geometry_inclusion_ops_2d", Method: "BRIN", Type: "geometry", Default: true},
+	{Name: "brin_geometry_inclusion_ops_3d", Method: "BRIN", Type: "geometry", Default: false},
+	{Name: "brin_geometry_inclusion_ops_4d", Method: "BRIN", Type: "geometry", Default: false},
+	{Name: "spgist_geography_ops_nd", Method: "SPGIST", Type: "geography", Default: true},
+	{Name: "spgist_geometry_ops_2d", Method: "SPGIST", Type: "geometry", Default: true},
+	{Name: "spgist_geometry_ops_3d", Method: "SPGIST", Type: "geometry", Default: false},
+	{Name: "spgist_geometry_ops_nd", Method: "SPGIST", Type: "geometry", Default: false},
+}
+
+var (
+	mapOnce sync.Once
+	byName map[string]struct{}
+)
+
+// HasClass reports if the given operator class name exists.
+func HasClass(name string) bool {
+	mapOnce.Do(func() {
+		byName = make(map[string]struct{}, len(Classes))
+		for _, c := range Classes {
+			byName[c.Name] = struct{}{}
+		}
+	})
+	_, ok := byName[name]
+	return ok
 }
